@@ -81,6 +81,7 @@ class TransferMetadata {
     struct SegmentDesc {
         std::string name;
         std::string protocol;
+        std::vector<std::string> supported_protocols;  // 支持的协议列表，按优先级排序
         // this is for rdma/shm
         std::vector<DeviceDesc> devices;
         Topology topology;
@@ -98,6 +99,20 @@ class TransferMetadata {
         int tcp_data_port;
 
         void dump() const;
+        
+        // 辅助方法
+        bool supportsProtocol(const std::string& proto) const {
+            return std::find(supported_protocols.begin(), supported_protocols.end(), proto) != supported_protocols.end();
+        }
+        
+        std::string getPreferredProtocol(const std::vector<std::string>& available_protocols) const {
+            for (const auto& proto : supported_protocols) {
+                if (std::find(available_protocols.begin(), available_protocols.end(), proto) != available_protocols.end()) {
+                    return proto;
+                }
+            }
+            return protocol;  // 回退到主协议
+        }
     };
 
     struct RpcMetaDesc {
