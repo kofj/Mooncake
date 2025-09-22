@@ -225,23 +225,45 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             }
         }
 #else
+        // 新的多协议安装逻辑：优先安装RDMA，同时安装TCP作为备选
+        bool rdma_installed = false;
+        bool tcp_installed = false;
+        LOG(INFO) << "🔥 Attempting to install RDMA and TCP transports...";
+        
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_TCP")) {
-            // only install RDMA transport when there is at least one HCA
+            // 安装RDMA transport
             Transport *rdma_transport =
                 multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
-                return -1;
-            }
-        } else {
-            Transport *tcp_transport =
-                multi_transports_->installTransport("tcp", nullptr);
-            if (!tcp_transport) {
-                LOG(ERROR) << "Failed to install TCP transport";
-                return -1;
+            if (rdma_transport) {
+                rdma_installed = true;
+                LOG(INFO) << "RDMA transport installed successfully";
+            } else {
+                LOG(WARNING) << "Failed to install RDMA transport, will use TCP as fallback";
             }
         }
+        
+        // 总是尝试安装TCP作为备选协议（除非明确禁用）
+        if (!getenv("MC_DISABLE_TCP_FALLBACK")) {
+            Transport *tcp_transport =
+                multi_transports_->installTransport("tcp", nullptr);
+            if (tcp_transport) {
+                tcp_installed = true;
+                LOG(INFO) << "TCP transport installed successfully";
+            } else {
+                LOG(WARNING) << "Failed to install TCP transport";
+            }
+        }
+        
+        // 确保至少有一个协议可用
+        if (!rdma_installed && !tcp_installed) {
+            LOG(ERROR) << "No transport protocols available";
+            return -1;
+        }
+        
+        LOG(INFO) << "Transport protocols installed: "
+                  << (rdma_installed ? "RDMA " : "")
+                  << (tcp_installed ? "TCP" : "");
 #endif
         // TODO: install other transports automatically
     }
