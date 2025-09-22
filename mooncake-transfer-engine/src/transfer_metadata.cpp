@@ -127,6 +127,15 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
+    
+    // 编码多协议支持
+    if (!desc.supported_protocols.empty()) {
+        Json::Value protocolsArray(Json::arrayValue);
+        for (const auto& proto : desc.supported_protocols) {
+            protocolsArray.append(proto);
+        }
+        segmentJSON["supported_protocols"] = protocolsArray;
+    }
 
     if (segmentJSON["protocol"] == "rdma") {
         Json::Value devicesJSON(Json::arrayValue);
@@ -276,6 +285,13 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    
+    // 解码多协议支持
+    if (segmentJSON.isMember("supported_protocols")) {
+        for (const auto& protoValue : segmentJSON["supported_protocols"]) {
+            desc->supported_protocols.push_back(protoValue.asString());
+        }
+    }
 
     if (desc->protocol == "rdma") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
@@ -303,8 +319,15 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
+                // print all case value
+                LOG(WARNING) << "🔥 Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol
+                             << "\t buffer name " << buffer.name
+                             << "\t buffer addr " << buffer.addr
+                             << "\t buffer length " << buffer.length
+                             << "\t rkey size " << buffer.rkey.size()
+                             << "\t lkey size " << buffer.lkey.size()
+                             << "\t rkey eq lkey" << (buffer.rkey.size() == buffer.lkey.size());
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
