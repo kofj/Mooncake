@@ -127,6 +127,66 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
+    
+    // 编码多协议支持
+    if (!desc.supported_protocols.empty()) {
+        Json::Value protocolsArray(Json::arrayValue);
+        for (const auto& proto : desc.supported_protocols) {
+            protocolsArray.append(proto);
+        }
+        segmentJSON["supported_protocols"] = protocolsArray;
+        
+        // 编码每个协议的具体配置
+        Json::Value protocolConfigsJSON(Json::objectValue);
+        for (const auto& [proto, config] : desc.protocol_configs) {
+            Json::Value configJSON;
+            configJSON["protocol"] = config.protocol;
+            configJSON["tcp_data_port"] = config.tcp_data_port;
+            
+            if (proto == "rdma") {
+                Json::Value devicesJSON(Json::arrayValue);
+                for (const auto &device : config.devices) {
+                    Json::Value deviceJSON;
+                    deviceJSON["name"] = device.name;
+                    deviceJSON["lid"] = device.lid;
+                    deviceJSON["gid"] = device.gid;
+                    devicesJSON.append(deviceJSON);
+                }
+                configJSON["devices"] = devicesJSON;
+                
+                Json::Value buffersJSON(Json::arrayValue);
+                for (const auto &buffer : config.buffers) {
+                    Json::Value bufferJSON;
+                    bufferJSON["name"] = buffer.name;
+                    bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+                    bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+                    Json::Value rkeyJSON(Json::arrayValue);
+                    for (auto &entry : buffer.rkey) rkeyJSON.append(entry);
+                    bufferJSON["rkey"] = rkeyJSON;
+                    Json::Value lkeyJSON(Json::arrayValue);
+                    for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
+                    bufferJSON["lkey"] = lkeyJSON;
+                    buffersJSON.append(bufferJSON);
+                }
+                configJSON["buffers"] = buffersJSON;
+                configJSON["priority_matrix"] = config.topology.toJson();
+            } else if (proto == "tcp") {
+                Json::Value buffersJSON(Json::arrayValue);
+                for (const auto &buffer : config.buffers) {
+                    Json::Value bufferJSON;
+                    bufferJSON["name"] = buffer.name;
+                    bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+                    bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+                    buffersJSON.append(bufferJSON);
+                }
+                configJSON["buffers"] = buffersJSON;
+            }
+            // 可以继续添加其他协议的编码逻辑
+            
+            protocolConfigsJSON[proto] = configJSON;
+        }
+        segmentJSON["protocol_configs"] = protocolConfigsJSON;
+    }
 
     if (segmentJSON["protocol"] == "rdma") {
         Json::Value devicesJSON(Json::arrayValue);
@@ -276,6 +336,79 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    
+    // 解码多协议支持
+    if (segmentJSON.isMember("supported_protocols")) {
+        for (const auto& protoValue : segmentJSON["supported_protocols"]) {
+            desc->supported_protocols.push_back(protoValue.asString());
+        }
+        
+        // 解码每个协议的具体配置
+        if (segmentJSON.isMember("protocol_configs")) {
+            const Json::Value& protocolConfigsJSON = segmentJSON["protocol_configs"];
+            for (const auto& protoName : protocolConfigsJSON.getMemberNames()) {
+                const Json::Value& configJSON = protocolConfigsJSON[protoName];
+                ProtocolConfig config;
+                config.protocol = protoName;
+                config.tcp_data_port = configJSON["tcp_data_port"].asInt();
+                
+                if (protoName == "rdma" && configJSON.isMember("devices")) {
+                    for (const auto &deviceJSON : configJSON["devices"]) {
+                        DeviceDesc device;
+                        device.name = deviceJSON["name"].asString();
+                        device.lid = deviceJSON["lid"].asUInt();
+                        device.gid = deviceJSON["gid"].asString();
+                        config.devices.push_back(device);
+                    }
+                    
+                    if (configJSON.isMember("buffers")) {
+                        for (const auto &bufferJSON : configJSON["buffers"]) {
+                            BufferDesc buffer;
+                            buffer.name = bufferJSON["name"].asString();
+                            buffer.addr = bufferJSON["addr"].asUInt64();
+                            buffer.length = bufferJSON["length"].asUInt64();
+                            for (const auto &entry : bufferJSON["rkey"]) {
+                                buffer.rkey.push_back(entry.asUInt());
+                            }
+                            for (const auto &entry : bufferJSON["lkey"]) {
+                                buffer.lkey.push_back(entry.asUInt());
+                            }
+                            config.buffers.push_back(buffer);
+                        }
+                    }
+                    
+                    if (configJSON.isMember("priority_matrix")) {
+                        Json::StreamWriterBuilder builder;
+                        std::string priority_matrix_str = Json::writeString(builder, configJSON["priority_matrix"]);
+                        config.topology.parse(priority_matrix_str);
+                    }
+                } else if (protoName == "tcp" && configJSON.isMember("buffers")) {
+                    for (const auto &bufferJSON : configJSON["buffers"]) {
+                        BufferDesc buffer;
+                        buffer.name = bufferJSON["name"].asString();
+                        buffer.addr = bufferJSON["addr"].asUInt64();
+                        buffer.length = bufferJSON["length"].asUInt64();
+                        config.buffers.push_back(buffer);
+                    }
+                }
+                // 可以继续添加其他协议的解码逻辑
+                
+                desc->protocol_configs[protoName] = config;
+            }
+        }
+        
+        // 为了向后兼容，也填充传统字段
+        if (!desc->supported_protocols.empty()) {
+            const std::string& primary_proto = desc->supported_protocols[0];
+            if (desc->protocol_configs.count(primary_proto)) {
+                const auto& primary_config = desc->protocol_configs[primary_proto];
+                desc->devices = primary_config.devices;
+                desc->topology = primary_config.topology;
+                desc->buffers = primary_config.buffers;
+                desc->tcp_data_port = primary_config.tcp_data_port;
+            }
+        }
+    }
 
     if (desc->protocol == "rdma") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {

@@ -78,26 +78,57 @@ class TransferMetadata {
 
     using SegmentID = uint64_t;
 
-    struct SegmentDesc {
-        std::string name;
+    struct ProtocolConfig {
         std::string protocol;
-        // this is for rdma/shm
+        // RDMA specific
         std::vector<DeviceDesc> devices;
         Topology topology;
         std::vector<BufferDesc> buffers;
-        // this is for nvmeof.
+        // TCP specific
+        int tcp_data_port;
+        // NVMeoF specific
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
-        // this is for cxl.
+        // CXL specific
         std::string cxl_name;
         uint64_t cxl_base_addr;
-        // TODO : make these two a union or a std::variant
-        std::string timestamp;
-        // this is for ascend
+        // Ascend specific
         RankInfoDesc rank_info;
+        
+        ProtocolConfig() : tcp_data_port(0), cxl_base_addr(0) {}
+    };
 
+    struct SegmentDesc {
+        std::string name;
+        std::string protocol;  // 保持向后兼容，主协议
+        std::vector<std::string> supported_protocols;  // 支持的所有协议列表，按优先级排序
+        std::unordered_map<std::string, ProtocolConfig> protocol_configs;  // 每个协议的具体配置
+        
+        // 向后兼容的字段
+        std::vector<DeviceDesc> devices;
+        Topology topology;
+        std::vector<BufferDesc> buffers;
+        std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+        std::string cxl_name;
+        uint64_t cxl_base_addr;
+        std::string timestamp;
+        RankInfoDesc rank_info;
         int tcp_data_port;
 
         void dump() const;
+        
+        // 辅助方法
+        bool supportsProtocol(const std::string& proto) const {
+            return std::find(supported_protocols.begin(), supported_protocols.end(), proto) != supported_protocols.end();
+        }
+        
+        std::string getPreferredProtocol(const std::vector<std::string>& available_protocols) const {
+            for (const auto& proto : supported_protocols) {
+                if (std::find(available_protocols.begin(), available_protocols.end(), proto) != available_protocols.end()) {
+                    return proto;
+                }
+            }
+            return protocol;  // 回退到主协议
+        }
     };
 
     struct RpcMetaDesc {
