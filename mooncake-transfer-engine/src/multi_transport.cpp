@@ -41,8 +41,21 @@
 #endif
 
 #include <cassert>
+#include <sstream>
 
 namespace mooncake {
+
+// 辅助函数：将字符串数组连接为一个字符串
+static std::string joinStrings(const std::vector<std::string>& strings, const std::string& delimiter) {
+    if (strings.empty()) return "";
+    
+    std::ostringstream oss;
+    for (size_t i = 0; i < strings.size(); ++i) {
+        if (i > 0) oss << delimiter;
+        oss << strings[i];
+    }
+    return oss.str();
+}
 MultiTransport::MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                                std::string &local_server_name)
     : metadata_(metadata), local_server_name_(local_server_name) {}
@@ -259,20 +272,43 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
-    auto proto = target_segment_desc->protocol;
+    
+    // 获取本地可用的协议列表
+    std::vector<std::string> available_protocols;
+    for (const auto& entry : transport_map_) {
+        available_protocols.push_back(entry.first);
+    }
+    
+    std::string selected_proto;
+    
+    // 如果目标segment支持多协议，按优先级选择
+    if (!target_segment_desc->supported_protocols.empty()) {
+        selected_proto = target_segment_desc->getPreferredProtocol(available_protocols);
+        LOG(INFO) << "Selected protocol " << selected_proto 
+                  << " for target segment " << target_segment_desc->name
+                  << " from supported protocols: " 
+                  << joinStrings(target_segment_desc->supported_protocols, ", ");
+    } else {
+        // 向后兼容：使用传统的单协议模式
+        selected_proto = target_segment_desc->protocol;
+        LOG(INFO) << "Using legacy single protocol mode: " << selected_proto;
+    }
+    
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
     // - Initiator side uses heterogeneous_rdma_transport
-    if (target_segment_desc->protocol == "rdma") {
-        proto = "ascend";
+    if (selected_proto == "rdma") {
+        selected_proto = "ascend";
     }
 #endif
-    if (!transport_map_.count(proto)) {
-        return Status::NotSupportedTransport("Transport " + proto +
+    
+    if (!transport_map_.count(selected_proto)) {
+        return Status::NotSupportedTransport("Transport " + selected_proto +
                                              " not installed");
     }
-    transport = transport_map_[proto].get();
+    
+    transport = transport_map_[selected_proto].get();
     return Status::OK();
 }
 
