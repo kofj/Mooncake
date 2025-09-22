@@ -225,23 +225,76 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             }
         }
 #else
-        if (local_topology_->getHcaList().size() > 0 &&
+        // 新的多协议安装逻辑：优先安装RDMA，同时安装TCP作为备选
+        bool rdma_installed = false;
+        bool tcp_installed = false;
+        LOG(INFO) << "🔥 Attempting to install RDMA and TCP transports...";
+
+        // 添加安全检查，防止空指针访问
+        if (local_topology_ && local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_TCP")) {
-            // only install RDMA transport when there is at least one HCA
-            Transport *rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
-                return -1;
+            LOG(INFO) << "Detected " << local_topology_->getHcaList().size() 
+                      << " RDMA devices, attempting RDMA installation...";
+            
+            try {
+                // 安装RDMA transport，添加异常处理
+                Transport *rdma_transport =
+                    multi_transports_->installTransport("rdma", local_topology_);
+                if (rdma_transport) {
+                    rdma_installed = true;
+                    LOG(INFO) << "RDMA transport installed successfully";
+                } else {
+                    LOG(WARNING) << "Failed to install RDMA transport, will use TCP as fallback";
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception during RDMA installation: " << e.what();
+                LOG(WARNING) << "Will use TCP as fallback";
+            } catch (...) {
+                LOG(ERROR) << "Unknown exception during RDMA installation";
+                LOG(WARNING) << "Will use TCP as fallback";
             }
         } else {
-            Transport *tcp_transport =
-                multi_transports_->installTransport("tcp", nullptr);
-            if (!tcp_transport) {
-                LOG(ERROR) << "Failed to install TCP transport";
-                return -1;
+            if (!local_topology_) {
+                LOG(WARNING) << "No topology information available, skipping RDMA";
+            } else if (local_topology_->getHcaList().size() == 0) {
+                LOG(INFO) << "No RDMA devices detected, using TCP only";
+            } else {
+                LOG(INFO) << "RDMA forced to be disabled by MC_FORCE_TCP";
             }
         }
+        
+        // 总是尝试安装TCP作为备选协议（除非明确禁用）
+        if (!getenv("MC_DISABLE_TCP_FALLBACK")) {
+            LOG(INFO) << "Installing TCP transport...";
+            try {
+                Transport *tcp_transport =
+                    multi_transports_->installTransport("tcp", nullptr);
+                LOG(INFO) << "TCP transport installation attempted" 
+                          << (tcp_transport ? " (success)" : " (failure)");
+                if (tcp_transport) {
+                    tcp_installed = true;
+                    LOG(INFO) << "TCP transport installed successfully";
+                } else {
+                    LOG(WARNING) << "Failed to install TCP transport";
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception during TCP installation: " << e.what();
+            } catch (...) {
+                LOG(ERROR) << "Unknown exception during TCP installation";
+            }
+        } else {
+            LOG(INFO) << "TCP transport disabled by MC_DISABLE_TCP_FALLBACK";
+        }
+        
+        // 确保至少有一个协议可用
+        if (!rdma_installed && !tcp_installed) {
+            LOG(ERROR) << "No transport protocols available";
+            return -1;
+        }
+        
+        LOG(INFO) << "Transport protocols installed: "
+                  << (rdma_installed ? "RDMA " : "")
+                  << (tcp_installed ? "TCP" : "");
 #endif
         // TODO: install other transports automatically
     }
