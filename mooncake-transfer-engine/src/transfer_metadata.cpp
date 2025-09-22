@@ -127,6 +127,15 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
+    
+    // 编码多协议支持
+    if (!desc.supported_protocols.empty()) {
+        Json::Value protocolsArray(Json::arrayValue);
+        for (const auto& proto : desc.supported_protocols) {
+            protocolsArray.append(proto);
+        }
+        segmentJSON["supported_protocols"] = protocolsArray;
+    }
 
     if (segmentJSON["protocol"] == "rdma") {
         Json::Value devicesJSON(Json::arrayValue);
@@ -276,6 +285,13 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    
+    // 解码多协议支持
+    if (segmentJSON.isMember("supported_protocols")) {
+        for (const auto& protoValue : segmentJSON["supported_protocols"]) {
+            desc->supported_protocols.push_back(protoValue.asString());
+        }
+    }
 
     if (desc->protocol == "rdma") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
@@ -303,8 +319,15 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
+                // print all case value
+                LOG(WARNING) << "🔥 Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol
+                             << "\t buffer name " << buffer.name
+                             << "\t buffer addr " << buffer.addr
+                             << "\t buffer length " << buffer.length
+                             << "\t rkey size " << buffer.rkey.size()
+                             << "\t lkey size " << buffer.lkey.size()
+                             << "\t rkey eq lkey" << (buffer.rkey.size() == buffer.lkey.size());
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -548,8 +571,52 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
-    return 0;
+
+    // check segment is already exist
+    if (segment_id_to_desc_map_.count(segment_id) &&
+        segment_name_to_id_map_.count(segment_name)) {
+        LOG(WARNING) << "Segment already exists, segment_id: " << segment_id
+                     << ", segment_name: " << segment_name;
+        // get exist segment desc
+        auto existing_desc = segment_id_to_desc_map_[segment_id];
+
+        // merge protocol info, if old not rdma
+        std::string new_protocol = desc->protocol;
+        if (new_protocol == "rdma" && std::find(existing_desc->supported_protocols.begin(),
+                     existing_desc->supported_protocols.end(),
+                     new_protocol) == existing_desc->supported_protocols.end()) {
+            existing_desc->supported_protocols.push_back(new_protocol);
+        }
+        if (new_protocol == "rdma") {
+            existing_desc->protocol = "rdma";
+            // move rdma to front
+            auto it = std::find(existing_desc->supported_protocols.begin(),
+                               existing_desc->supported_protocols.end(), "rdma");
+            if (it != existing_desc->supported_protocols.end()) {
+                existing_desc->supported_protocols.erase(it);
+                existing_desc->supported_protocols.insert(existing_desc->supported_protocols.begin(), "rdma");
+            }
+        }
+
+        // merge device info, mainly for rdma
+        if (!desc->devices.empty()) {
+            existing_desc->devices = desc->devices;
+            existing_desc->topology = desc->topology;
+        }
+
+        // merge tcp port info
+        if (desc->tcp_data_port > 0) {
+            existing_desc->tcp_data_port = desc->tcp_data_port;
+        }
+
+        return 0;
+    } else {
+        segment_id_to_desc_map_[segment_id] = desc;
+        segment_name_to_id_map_[segment_name] = segment_id;
+        return 0;
+    }
 }
+
 
 int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
     RWSpinlock::WriteGuard guard(segment_lock_);
@@ -569,7 +636,33 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
         auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
         *new_segment_desc = *segment_desc;
         segment_desc = new_segment_desc;
-        segment_desc->buffers.push_back(buffer_desc);
+        // check if buffer with same addr already exists
+        bool buffer_exists = false;
+        for (auto &existing_buffer : segment_desc->buffers) {
+            if (existing_buffer.addr == buffer_desc.addr) {
+                // If the buffer with the same address is found, update its information (merge rkey/lkey)
+                if (!buffer_desc.rkey.empty() && existing_buffer.rkey.empty()) {
+                    existing_buffer.rkey = buffer_desc.rkey;
+                }
+                if (!buffer_desc.lkey.empty() && existing_buffer.lkey.empty()) {
+                    existing_buffer.lkey = buffer_desc.lkey;
+                }
+                // Update other fields
+                if (!buffer_desc.name.empty()) {
+                    existing_buffer.name = buffer_desc.name;
+                }
+                if (buffer_desc.length > 0) {
+                    existing_buffer.length = buffer_desc.length;
+                }
+                buffer_exists = true;
+                break;
+            }
+        }
+
+        // if not exists, add new buffer
+        if (!buffer_exists) {
+            segment_desc->buffers.push_back(buffer_desc);
+        }
     }
     if (update_metadata) return updateLocalSegmentDesc();
     return 0;
