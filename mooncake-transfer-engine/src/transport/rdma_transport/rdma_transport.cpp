@@ -132,21 +132,26 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
-    desc->name = local_server_name_;
-    desc->protocol = "rdma";
+    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_desc->name = local_server_name_;
+    segment_desc->protocol = "rdma";  // 主协议
+    
+    // 设置支持的协议列表（RDMA优先）
+    segment_desc->supported_protocols.push_back("rdma");
+    
+    // 设置RDMA设备信息
     for (auto &entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
         device_desc.lid = entry->lid();
         device_desc.gid = entry->gid();
-        desc->devices.push_back(device_desc);
+        segment_desc->devices.push_back(device_desc);
     }
-    desc->topology = *(local_topology_.get());
-    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
-                               std::move(desc));
-    return 0;
+    segment_desc->topology = *(local_topology_.get());
+    
+    return metadata_->addLocalSegment(TransferMetadata::LOCAL_SEGMENT_ID, 
+                                     local_server_name_, 
+                                     std::move(segment_desc));
 }
 
 int RdmaTransport::registerLocalMemoryBatch(

@@ -308,14 +308,37 @@ int TcpTransport::install(std::string &local_server_name,
 }
 
 int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
-    desc->name = local_server_name_;
-    desc->protocol = "tcp";
-    desc->tcp_data_port = tcp_data_port;
-    metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
-                               std::move(desc));
-    return 0;
+    // 检查是否已经存在segment（可能RDMA已经创建了）
+    auto existing_desc = metadata_->getSegmentDescByName(local_server_name_);
+    
+    if (existing_desc) {
+        // 如果已存在segment，添加TCP协议支持
+        if (!existing_desc->supportsProtocol("tcp")) {
+            existing_desc->supported_protocols.push_back("tcp");
+        }
+        existing_desc->tcp_data_port = tcp_data_port;
+        
+        // 如果没有主协议或主协议不可用，设置TCP为主协议
+        if (existing_desc->protocol.empty() || 
+            (!existing_desc->supportsProtocol("rdma") && existing_desc->protocol == "rdma")) {
+            existing_desc->protocol = "tcp";
+        }
+        
+        return metadata_->updateSegmentDesc(local_server_name_, *existing_desc);
+    } else {
+        // 创建新的segment
+        auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+        segment_desc->name = local_server_name_;
+        segment_desc->protocol = "tcp";  // 主协议
+        segment_desc->tcp_data_port = tcp_data_port;
+        
+        // 设置支持的协议列表
+        segment_desc->supported_protocols.push_back("tcp");
+        
+        return metadata_->addLocalSegment(TransferMetadata::LOCAL_SEGMENT_ID, 
+                                         local_server_name_, 
+                                         std::move(segment_desc));
+    }
 }
 
 int TcpTransport::registerLocalMemory(void *addr, size_t length,
