@@ -36,11 +36,13 @@ namespace mooncake {
 class RdmaContext;
 class RdmaEndPoint;
 class TransferMetadata;
+class RdmaTransportTestPeer;
 class WorkerPool;
 
 class RdmaTransport : public Transport {
     friend class RdmaContext;
     friend class RdmaEndPoint;
+    friend class RdmaTransportTestPeer;
     friend class WorkerPool;
 
    public:
@@ -71,13 +73,26 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
-    // TRANSFER
+   private:
+    // Internal version with force_sequential option to avoid nested parallelism
+    int registerLocalMemoryInternal(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible,
+                                    bool update_metadata,
+                                    bool force_sequential);
 
+    int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
+                                      bool force_sequential);
+
+   public:
+    // TRANSFER
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries) override;
 
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
+
+    bool supportsGroupedScatter() const override { return true; }
 
     Status getTransferStatus(BatchID batch_id,
                              std::vector<TransferStatus> &status);
@@ -90,13 +105,18 @@ class RdmaTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-   public:
-    int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                               HandShakeDesc &local_desc);
+    int refreshLocalDeviceDesc(const std::string &device_name, uint16_t lid,
+                               const std::string &gid);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc) {
+    int preTouchMemory(void *addr, size_t length);
+
+   public:
+    virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
+                                       HandShakeDesc &local_desc);
+
+    virtual int sendHandshake(const std::string &peer_server_name,
+                              const HandShakeDesc &local_desc,
+                              HandShakeDesc &peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
     }
@@ -112,10 +132,31 @@ class RdmaTransport : public Transport {
     static int selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
                             std::string_view hint, int &buffer_id,
                             int &device_id, int retry_cnt = 0);
+    static int selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                      size_t length, std::string_view local_hca,
+                                      int &buffer_id, int &device_id,
+                                      int retry_cnt = 0);
+
+    const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
+        return context_list_;
+    }
 
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+    // When MC_RDMA_BIND_ADDRESS is set in a dual-NIC environment,
+    // rdma_server_name_ holds the RDMA-reachable address (e.g.
+    // "192.168.0.y:port") for NIC path construction, while
+    // local_server_name_ keeps the TCP-reachable address for P2P routing.
+    std::string rdma_server_name_;
+    std::mutex local_desc_lock_;
+    // Mooncake#2017: buffers larger than the device max_mr_size are split into
+    // multiple sub-max_mr_size MRs (one BufferDesc per chunk) so that
+    // ibv_reg_mr is never silently truncated. unregisterLocalMemory() only
+    // receives the base addr, so remember each base buffer's chunk
+    // start-addresses for cleanup.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 };
 
 using TransferRequest = Transport::TransferRequest;

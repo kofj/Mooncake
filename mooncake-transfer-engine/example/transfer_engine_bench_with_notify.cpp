@@ -30,20 +30,24 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
+#include "cuda_alike.h"
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
-
-#ifdef USE_NVLINK
-#include <transport/nvlink_transport/nvlink_transport.h>
 #endif
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 #include <cassert>
+
+#if defined(USE_MNNVL) || defined(USE_MUSA)
+#include "gpu_vendor/mnnvl.h"
+#endif
+
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
 
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
@@ -54,7 +58,8 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 const static int NR_SOCKETS = 4;
 #else
 const static int NR_SOCKETS =
@@ -69,7 +74,7 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|musa|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -86,8 +91,10 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
@@ -95,17 +102,25 @@ using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#ifdef USE_NVLINK
-        d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+#if defined(USE_MNNVL) || defined(USE_MUSA)
+        d_buf = allocateFabricMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
 #endif
+        if (FLAGS_init_mem) {
+            checkCudaError(cudaMemset(d_buf, 0xCC, size),
+                           "Failed to initialize device memory");
+            // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        }
+
         return d_buf;
     }
 #endif
@@ -113,15 +128,15 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#ifdef USE_CUDA
-#ifdef USE_NVLINK
-    CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
-    if (result == CUDA_SUCCESS) {
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
+#if defined(USE_MNNVL) || defined(USE_MUSA)
+    if (FLAGS_use_vram) {
+        freeFabricMemory(addr);
         return;
     }
-#endif
+#endif  // USE_MNNVL || USE_MUSA
+
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -281,6 +296,12 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"cuda:0\": [[" +
+           device_names +
+           "], []], "
+           " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -300,10 +321,19 @@ int initiator() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             xport = engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            xport = engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             xport = engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "musa") {
+            xport = engine->installTransport("musa", nullptr);
+        } else if (FLAGS_protocol == "nvlink_intra") {
+            xport = engine->installTransport("nvlink_intra", nullptr);
+        } else if (FLAGS_protocol == "hip") {
+            xport = engine->installTransport("hip", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -313,11 +343,12 @@ int initiator() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
+        std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
         LOG_ASSERT(!rc);
@@ -395,10 +426,17 @@ int target() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "ub") {
+            engine->getLocalTopology()->discover({FLAGS_device_name});
+            engine->installTransport(FLAGS_protocol, nullptr);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "musa") {
+            engine->installTransport("musa", nullptr);
+        } else if (FLAGS_protocol == "hip") {
+            engine->installTransport("hip", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -407,11 +445,12 @@ int target() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
-        std::string name_prefix = FLAGS_use_vram ? "cuda:" : "cpu:";
+        std::string name_prefix = FLAGS_use_vram ? GPU_PREFIX : "cpu:";
         int rc = engine->registerLocalMemory(addr[i], FLAGS_buffer_size,
                                              name_prefix + std::to_string(i));
         LOG_ASSERT(!rc);
@@ -438,11 +477,7 @@ int target() {
     }
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_NVLINK
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
-#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
-#endif
     }
 
     return 0;

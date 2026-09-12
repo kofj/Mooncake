@@ -15,24 +15,37 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <functional>
 #include <unordered_map>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+class TransferEngineImpl;
+class TransferEngineImplTestPeer;
+class MultiTransportTestPeer;
+
 class MultiTransport {
+    friend class TransferEngineImpl;
+    friend class TransferEngineImplTestPeer;
+    friend class MultiTransportTestPeer;
+
    public:
     using BatchID = Transport::BatchID;
     using TransferRequest = Transport::TransferRequest;
     using TransferStatus = Transport::TransferStatus;
+    using TransferStatusEnum = Transport::TransferStatusEnum;
     using BatchDesc = Transport::BatchDesc;
-
-    const static BatchID INVALID_BATCH_ID = Transport::INVALID_BATCH_ID;
 
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                    std::string &local_server_name);
 
     ~MultiTransport();
+
+    struct ScatterSubmission {
+        BatchID batch_id = static_cast<BatchID>(-1);
+        std::vector<size_t> task_sizes;
+    };
 
     BatchID allocateBatchID(size_t batch_size);
 
@@ -41,8 +54,21 @@ class MultiTransport {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
 
+    Status submitScatter(const std::vector<TransferRequest> &entries,
+                         ScatterSubmission &submission);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    Status mp_submitTransfer(BatchID batch_id,
+                             const std::vector<TransferRequest> &entries,
+                             std::string &proto);
+#endif
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
+
+    Status getScatterRequestStatuses(
+        BatchID batch_id, size_t task_id,
+        std::vector<TransferStatusEnum> &request_statuses);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
 
@@ -51,10 +77,34 @@ class MultiTransport {
 
     Transport *getTransport(const std::string &proto);
 
+    /**
+     * @brief Check if TCP is the only installed host transport.
+     *
+     * When only TCP is available (no RDMA, NVLink, etc.), local memcpy is
+     * preferred over TCP loopback for same-host transfers. POSIX SHM is
+     * intra-node only and does not change this classification.
+     */
+    bool isTcpOnly() const;
+
     std::vector<Transport *> listTransports();
 
+    void *getBaseAddr();
+
    private:
+    Status freeBatchID(BatchID batch_id,
+                       const std::function<void()> &before_delete);
+
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries,
+                          std::vector<size_t> *task_sizes);
+
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
+
+#ifdef ENABLE_MULTI_PROTOCOL
+    Status mp_selectTransport(const TransferRequest &entry,
+                              Transport *&transport,
+                              std::string &preferred_proto);
+#endif
 
    private:
     std::shared_ptr<TransferMetadata> metadata_;

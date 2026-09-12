@@ -11,6 +11,8 @@ The E2E test suite includes several executable programs designed to test differe
 - **e2e_rand_test**: Long-term randomized end-to-end testing.
 - **chaos_test**: Short-term chaos testing with predefined scenarios.
 - **chaos_rand_test**: Long-term randomized chaos testing with configurable parameters.
+- **store_client_e2e.py**: Python `MooncakeDistributedStore` client that continuously issues `put/get` operations.
+- **run_nof_heartbeat_tcp_e2e.sh**: Scripted NoF heartbeat end-to-end test using a TCP SPDK target.
 
 ## Parameters
 
@@ -73,3 +75,114 @@ Currently it only has few test cases. Will add more in the future.
 
 **[WIP]**:
 Currently it only has few test cases. Will add more in the future.
+
+### run_nof_heartbeat_tcp_e2e.sh
+
+**Brief**: Launches a real four-component path for NoF heartbeat validation:
+
+- `mooncake_master`
+- standalone Python HTTP metadata server
+- SPDK `nvmf_tgt` with TCP transport
+- Python client built on `MooncakeDistributedStore`
+
+The script first verifies steady-state `put/get` success with `memory + nof` replicas. It then kills the SPDK target, waits for the master heartbeat thread to emit `action=unmount_nof_segment_by_heartbeat`, and finally verifies that the client still observes successful I/O after the NoF segment is removed.
+
+**Prerequisites**:
+
+- `BUILD_DIR` points to a build tree that already contains:
+  - `mooncake-store/src/mooncake_master`
+  - `mooncake-integration/store*.so`
+- SPDK has already been built under `extern/spdk`
+- Python environment contains `aiohttp` because the script launches a standalone metadata process with `mooncake-wheel/mooncake/http_metadata_server.py`
+- The script uses `sudo -n` to set hugepages and mount `/dev/hugepages`, so the current user must have passwordless sudo
+
+**Usage**:
+
+```bash
+cd mooncake-store/tests/e2e
+BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e.sh
+```
+
+To run in **NoF-only** mode (do not mount a local memory segment), set:
+
+```bash
+CLIENT_GLOBAL_SEGMENT_SIZE=0 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e.sh
+```
+
+To increase the amount of steady-state traffic before killing the target, set:
+
+```bash
+PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e.sh
+```
+
+**Notes**:
+
+- The client payload size defaults to `4096` bytes because the current NoF path requires 4K-aligned I/O.
+- The script uses a standalone metadata server process (`mooncake-wheel/mooncake/http_metadata_server.py`) instead of the embedded master metadata server so all four components remain explicit during the test.
+- In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
+- In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
+- Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
+
+### store_client_e2e.py
+
+**Brief**: A standalone Python workload generator built on `MooncakeDistributedStore`. It continuously issues `put/get` against the configured master/metadata pair and prints `put_ok/get_ok/put_fail/get_fail` lines that can be consumed by shell scripts.
+
+**Standalone Usage**:
+
+```bash
+PYTHONPATH=/path/to/build/mooncake-integration \
+python3 store_client_e2e.py \
+  --local-hostname 127.0.0.1:50071 \
+  --metadata-server http://127.0.0.1:8080/metadata \
+  --master-server 127.0.0.1:50051 \
+  --global-segment-size 67108864 \
+  --local-buffer-size 33554432 \
+  --payload-size 4096 \
+  --duration-sec 20 \
+  --sleep-ms 200 \
+  --key-prefix demo
+```
+
+**Key Parameters**:
+
+- `--global-segment-size 0`: run in NoF-only mode
+- `--payload-size 4096`: keep NoF writes 4K aligned
+- `--duration-sec`: total workload duration
+- `--sleep-ms`: interval between operations
+
+### run_oplog_snapshot_smoke.sh
+
+Runs the batch OpLog snapshot path with two real master processes and a local
+etcd instance. It publishes two snapshots with multiple object chunks, stops
+and restarts the standby, verifies suffix replay and promotion, and audits
+surviving and removed objects.
+
+```bash
+./run_oplog_snapshot_smoke.sh \
+  --build-dir /path/to/build \
+  --run-dir /tmp/mooncake-oplog-snapshot-smoke
+```
+
+Set `--failpoint-dir` to verify the same launcher environment path used by
+crash tests. The script requires `mooncake_master`, `oplog_ha_client`,
+`oplog_batch_inspector`, `hot_standby_snapshot_bootstrap_test`, `etcd`,
+`etcdctl`, `curl`, `setsid`, and Python `aiohttp`. It is a manual real-etcd
+check and is not registered in CI/nightly.
+
+The run directory must be new. The script stores configurations, master and
+client logs, snapshot artifacts, and audit results there, and stops its test
+processes on exit. Local snapshot storage is shared by the two test masters;
+for multi-host deployment, every master must be able to read the same durable
+snapshot artifacts.
+
+The production mode is opt-in with `enable_oplog_snapshot=true` together with
+`enable_oplog=true`, HA/etcd and a configured snapshot object store. The default
+chunk size is 1,000,000 objects and the default snapshot interval is 600 seconds.
+The smoke overrides these to two objects and two seconds. A chunk bounds object
+count, not byte size or total standby memory. Legacy catalog restore is not
+used by this mode. Snapshot upload failures do not stop OpLog apply, but a node
+must not serve if its recovery history cannot be proven complete.
+
+This smoke does not cover the full crash/corruption/lease-contention matrix,
+S3 outages, large-scale memory/freeze-time measurements, or safe OpLog pruning.
+Keep batch history until retention/pruning has its own verified recovery gate.

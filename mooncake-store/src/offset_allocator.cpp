@@ -1,14 +1,14 @@
 // (C) Sebastian Aaltonen 2023
 // MIT License (see file: LICENSE)
 
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 
 #include <cmath>
 #include <iomanip>
 #include <iostream>
 
+#include "common/byte_size.h"
 #include "mutex.h"
-#include "utils.h"
 
 #ifdef DEBUG
 #include <assert.h>
@@ -129,9 +129,7 @@ uint32 findLowestSetBitAfter(uint32 bitMask, uint32 startBitIndex) {
 __Allocator::__Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity)
     : m_size(size),
       m_current_capacity(init_capacity),
-      m_max_capacity(std::max(init_capacity, max_capacity)),
-      m_nodes(nullptr),
-      m_freeNodes(nullptr) {
+      m_max_capacity(std::max(init_capacity, max_capacity)) {
     if (sizeof(NodeIndex) == 2) {
         ASSERT(m_max_capacity <= 65536);
     }
@@ -144,14 +142,14 @@ __Allocator::__Allocator(__Allocator&& other)
       m_max_capacity(other.m_max_capacity),
       m_freeStorage(other.m_freeStorage),
       m_usedBinsTop(other.m_usedBinsTop),
-      m_nodes(other.m_nodes),
-      m_freeNodes(other.m_freeNodes),
+      m_nodes(std::move(other.m_nodes)),
+      m_freeNodes(std::move(other.m_freeNodes)),
       m_freeOffset(other.m_freeOffset) {
     memcpy(m_usedBins, other.m_usedBins, sizeof(uint8) * NUM_TOP_BINS);
     memcpy(m_binIndices, other.m_binIndices, sizeof(NodeIndex) * NUM_LEAF_BINS);
 
-    other.m_nodes = nullptr;
-    other.m_freeNodes = nullptr;
+    other.m_nodes.clear();
+    other.m_freeNodes.clear();
     other.m_freeOffset = 0;
     other.m_current_capacity = 0;
     other.m_max_capacity = 0;
@@ -167,11 +165,14 @@ void __Allocator::reset() {
 
     for (uint32 i = 0; i < NUM_LEAF_BINS; i++) m_binIndices[i] = Node::unused;
 
-    if (m_nodes) delete[] m_nodes;
-    if (m_freeNodes) delete[] m_freeNodes;
+    m_nodes.clear();
+    m_freeNodes.clear();
 
-    m_nodes = new Node[m_max_capacity];
-    m_freeNodes = new NodeIndex[m_max_capacity];
+    m_nodes.reserve(m_max_capacity);
+    m_freeNodes.reserve(m_max_capacity);
+
+    m_nodes.resize(m_current_capacity);
+    m_freeNodes.resize(m_current_capacity);
 
     // Freelist is a stack. Nodes in inverse order so that [0] pops first.
     for (uint32 i = 0; i < m_current_capacity; i++) {
@@ -183,11 +184,6 @@ void __Allocator::reset() {
     insertNodeIntoBin(m_size, 0);
 }
 
-__Allocator::~__Allocator() {
-    delete[] m_nodes;
-    delete[] m_freeNodes;
-}
-
 OffsetAllocation __Allocator::allocate(uint32 size) {
     // Out of allocations?
     if (m_freeOffset == m_max_capacity) {
@@ -195,7 +191,8 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
                                 OffsetAllocation::NO_SPACE);
     }
     if (m_freeOffset == m_current_capacity) {
-        m_freeNodes[m_current_capacity] = m_current_capacity;
+        m_freeNodes.push_back(m_current_capacity);
+        m_nodes.emplace_back();
         m_current_capacity++;
     }
 
@@ -287,9 +284,9 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     return OffsetAllocation(node.dataOffset, nodeIndex);
 }
 
-void __Allocator::free(OffsetAllocation allocation) {
+uint32 __Allocator::free(OffsetAllocation allocation) {
     ASSERT(allocation.metadata != OffsetAllocation::NO_SPACE);
-    if (!m_nodes) return;
+    if (m_nodes.empty()) return 0;
 
     uint32 nodeIndex = allocation.metadata;
     Node& node = m_nodes[nodeIndex];
@@ -351,6 +348,8 @@ void __Allocator::free(OffsetAllocation allocation) {
         m_nodes[combinedNodeIndex].neighborPrev = neighborPrev;
         m_nodes[neighborPrev].neighborNext = combinedNodeIndex;
     }
+
+    return m_freeOffset < m_max_capacity ? size : 0;
 }
 
 uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
@@ -440,7 +439,7 @@ void __Allocator::removeNodeFromBin(uint32 nodeIndex) {
 
 uint32 __Allocator::allocationSize(OffsetAllocation allocation) const {
     if (allocation.metadata == OffsetAllocation::NO_SPACE) return 0;
-    if (!m_nodes) return 0;
+    if (m_nodes.empty()) return 0;
 
     return m_nodes[allocation.metadata].dataSize;
 }
@@ -558,6 +557,24 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
       m_capacity(size) {
     m_allocator = std::make_unique<__Allocator>(size >> m_multiplier_bits,
                                                 init_capacity, max_capacity);
+    m_largest_free_region.store(
+        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits,
+        std::memory_order_relaxed);
+}
+
+OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
+                                 uint64_t multiplier_bits,
+                                 std::unique_ptr<__Allocator> allocator)
+    : m_allocator(std::move(allocator)),
+      m_base(base),
+      m_multiplier_bits(multiplier_bits),
+      m_capacity(size) {
+    const uint64_t largest_free_region =
+        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
+    m_largest_free_region.store(largest_free_region, std::memory_order_relaxed);
+    const uint64_t allocator_capacity =
+        static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+    m_largest_free_region_tightened = largest_free_region < allocator_capacity;
 }
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
@@ -565,12 +582,15 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
-    MutexLocker guard(&m_mutex);
-    if (!m_allocator) {
+    // Free regions are grouped into size bins. A request larger than the
+    // highest free-bin boundary rounds up to a higher bin and cannot fit. The
+    // cached value is only a fast-fail hint: a stale larger value merely falls
+    // through to the mutex-protected allocator.
+    if (size > getLargestFreeRegion()) {
         return std::nullopt;
     }
 
-    size_t fake_size =
+    const size_t fake_size =
         m_multiplier_bits > 0
             ? ((size + (static_cast<uint64_t>(1) << m_multiplier_bits) - 1u) >>
                m_multiplier_bits)
@@ -580,13 +600,23 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator) {
+        return std::nullopt;
+    }
+
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
     if (allocation.isNoSpace()) {
-        // Log metrics to help understand why allocation failed
-        // Note: We're already holding m_mutex, so use internal method
-        OffsetAllocatorMetrics metrics = get_metrics_internal();
-        VLOG(1) << "OffsetAllocator allocation failed: size=" << size
-                << ", fake_size=" << fake_size << ", " << metrics;
+        // A request can pass the conservative hint but still fail because
+        // the allocator state changed concurrently. Tighten the hint after
+        // observing the authoritative state under the mutex.
+        refreshLargestFreeRegion();
+        if (VLOG_IS_ON(1)) {
+            // We're already holding m_mutex, so use the internal method.
+            const OffsetAllocatorMetrics metrics = get_metrics_internal();
+            VLOG(1) << "OffsetAllocator allocation failed: size=" << size
+                    << ", fake_size=" << fake_size << ", " << metrics;
+        }
         return std::nullopt;
     }
 
@@ -594,10 +624,31 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     m_allocated_size += size;
     m_allocated_num++;
 
-    // Use shared_from_this to get a shared_ptr to this OffsetAllocator
-    return OffsetAllocationHandle(
-        shared_from_this(), allocation,
-        m_base + (allocation.getOffset() << m_multiplier_bits), size);
+    const uint64_t real_base =
+        m_base + (allocation.getOffset() << m_multiplier_bits);
+    guard.unlock();
+
+    // Handle construction and shared_ptr reference-counting do not access
+    // allocator state and should not extend the serialized critical section.
+    return OffsetAllocationHandle(shared_from_this(), allocation, real_base,
+                                  size);
+}
+
+uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
+    if (size == 0) {
+        return 0;
+    }
+    const uint64_t quantum = uint64_t{1} << m_multiplier_bits;
+    if (size > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
+        return 0;
+    }
+    const uint64_t fake_size = (size + quantum - 1) >> m_multiplier_bits;
+    if (fake_size > SmallFloat::MAX_BIN_SIZE) {
+        return 0;
+    }
+    return static_cast<uint64_t>(SmallFloat::floatToUint(
+               SmallFloat::uintToFloatRoundUp(static_cast<uint32>(fake_size))))
+           << m_multiplier_bits;
 }
 
 OffsetAllocStorageReport OffsetAllocator::storageReport() const {
@@ -647,14 +698,55 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
     return get_metrics_internal();
 }
 
+void OffsetAllocator::refreshLargestFreeRegion() {
+    const uint64_t largest_free_region =
+        m_allocator ? m_allocator->storageReport().largestFreeRegion
+                          << m_multiplier_bits
+                    : 0;
+    m_largest_free_region.store(largest_free_region, std::memory_order_relaxed);
+    const uint64_t allocator_capacity =
+        m_allocator
+            ? static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits
+            : 0;
+    m_largest_free_region_tightened =
+        m_allocator && largest_free_region < allocator_capacity;
+}
+
 void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
-        m_allocator->free(allocation);
-        // Update lightweight metrics
-        m_allocated_size -= size;
-        m_allocated_num--;
+        const uint64_t freed_region =
+            static_cast<uint64_t>(m_allocator->free(allocation))
+            << m_multiplier_bits;
+        if (m_largest_free_region_tightened) {
+            // Before free, the hint is an upper bound for every existing free
+            // region. Only the newly merged region can raise that bound.
+            const uint64_t current_hint =
+                m_largest_free_region.load(std::memory_order_relaxed);
+            if (freed_region > current_hint) {
+                m_largest_free_region.store(freed_region,
+                                            std::memory_order_relaxed);
+            }
+            const uint64_t allocator_capacity =
+                static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+            if (freed_region >= allocator_capacity) {
+                m_largest_free_region_tightened = false;
+            }
+        }
+        // Update lightweight metrics.  Saturate instead of wrapping:
+        // recovery may free nodes whose exact requested size is unknown
+        // (corrupt record), and an unsigned underflow would poison the
+        // metric permanently.
+        if (size > m_allocated_size) {
+            LOG(WARNING) << "freeAllocation: size " << size
+                         << " exceeds allocated_size " << m_allocated_size
+                         << " -- clamping to 0";
+            m_allocated_size = 0;
+        } else {
+            m_allocated_size -= size;
+        }
+        if (m_allocated_num > 0) m_allocated_num--;
     }
 }
 
@@ -670,11 +762,39 @@ std::ostream& operator<<(std::ostream& os,
        << ", allocs=" << metrics.allocated_num_
        << ", capacity=" << mooncake::byte_size_to_string(metrics.capacity)
        << ", utilization=" << std::fixed << std::setprecision(1) << utilization
-       << "%" << ", free_space="
+       << "%"
+       << ", free_space="
        << mooncake::byte_size_to_string(metrics.total_free_space_)
        << ", largest_free="
        << mooncake::byte_size_to_string(metrics.largest_free_region_) << "}";
     return os;
+}
+
+// ============================================================================
+// Recovery helpers
+// ============================================================================
+
+std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
+    uint32_t node_index, uint64_t real_offset, uint64_t requested_size) {
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator || node_index >= m_allocator->m_current_capacity)
+        return std::nullopt;
+    const auto& node = m_allocator->m_nodes[node_index];
+    if (!node.used) return std::nullopt;
+
+    // Cross-validate: real_offset must match the node's stored offset.
+    uint64_t expected_offset =
+        m_base + (static_cast<uint64_t>(node.dataOffset) << m_multiplier_bits);
+    if (expected_offset != real_offset) {
+        LOG(ERROR) << "node/offset mismatch: node_index=" << node_index
+                   << " expected_offset=" << expected_offset
+                   << " real_offset=" << real_offset;
+        return std::nullopt;
+    }
+
+    OffsetAllocation allocation(node.dataOffset, node_index);
+    return OffsetAllocationHandle(shared_from_this(), allocation, real_offset,
+                                  requested_size);
 }
 
 }  // namespace mooncake::offset_allocator

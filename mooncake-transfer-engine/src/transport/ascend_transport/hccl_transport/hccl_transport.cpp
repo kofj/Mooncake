@@ -35,6 +35,11 @@ static int getTransferTimeoutMs() {
     return env ? std::stoi(env) : 20000;
 }
 
+static bool getTransferEnableFastRecovery() {
+    static char *env = getenv("ASCEND_TRANSPORT_TRANSFER_ENABLE_FAST_RECOVERY");
+    return env != nullptr && std::string(env) == "1";
+}
+
 HcclTransport::HcclTransport() : running_(-1) {
     // TODO
 }
@@ -68,6 +73,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
 
     int transfer_max_retry_cnt = getTransferMaxRetryCnt();
     int transfer_timeout_ms = getTransferTimeoutMs();
+    bool transfer_enable_fast_recovery = getTransferEnableFastRecovery();
 
     while (1) {
         auto waitlock = std::chrono::high_resolution_clock::now();
@@ -165,7 +171,11 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                               << inet_ntoa(remote_rank_info_.hostIp)
                               << ", remote devicePhyId: "
                               << remote_rank_info_.devicePhyId;
-                    clearTransportMem(&remote_rank_info_);
+                    if (transfer_enable_fast_recovery) {
+                        clearTransportMems();
+                    } else {
+                        clearTransportMem(&remote_rank_info_);
+                    }
                     continue;
                 }
                 LOG(ERROR) << "Hccl transport failed after "
@@ -199,8 +209,7 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
                           << ", batch waitlock spent: " << duration_wait.count()
                           << "ms"
                           << ", batch call spent: " << duration_call.count()
-                          << "us"
-                          << ", batch addOpfence spent: "
+                          << "us" << ", batch addOpfence spent: "
                           << duration_addOpfence.count() << "us"
                           << ", batch sync spent: " << duration_sync.count()
                           << "us";
@@ -598,15 +607,23 @@ int HcclTransport::allocateLocalSegmentID() {
 int HcclTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, -1);
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int HcclTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, -1);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (auto &addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 }  // namespace mooncake

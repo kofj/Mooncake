@@ -12,531 +12,1409 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <chrono>
+#include <cassert>
+#include <limits>
+#include <thread>
+#include <unordered_map>
+
+#ifndef USE_TENT
 #include "transfer_engine.h"
-
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
-#include <fstream>
-#include <string>
-#include <sys/resource.h>
-#include <unistd.h>
-
-#include "transfer_metadata_plugin.h"
-#include "transport/transport.h"
+#include "show_links.h"
+#include "transfer_engine_impl.h"
+#include "graceful_shutdown.h"
+#include <mutex>
+#include <utility>
 
 namespace mooncake {
+namespace {
 
-static bool setFilesLimit() {
-    struct rlimit filesLimit;
-    if (getrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
-        LOG(ERROR) << "getrlimit failed: " << strerror(errno);
-        return false;
+class TransferEngineShutdownToken : public ShutdownToken {
+   public:
+    explicit TransferEngineShutdownToken(TransferEngine* engine)
+        : engine_(engine) {}
+
+    void shutdown() override {
+        TransferEngine* engine = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            engine = engine_;
+            engine_ = nullptr;
+        }
+        if (engine) engine->freeEngine();
     }
-    rlim_t target_limit = filesLimit.rlim_max;
-    // Skip if already sufficient
-    if (filesLimit.rlim_cur >= target_limit) {
-        return true;
+
+    void detach() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        engine_ = nullptr;
     }
-    filesLimit.rlim_cur = target_limit;
-    if (setrlimit(RLIMIT_NOFILE, &filesLimit) != 0) {
-        LOG(ERROR) << "setrlimit failed: " << strerror(errno);
-        return false;
-    }
-    return true;
+
+   private:
+    std::mutex mutex_;
+    TransferEngine* engine_;
+};
+
+std::shared_ptr<ShutdownToken> registerTransferEngineShutdownToken(
+    TransferEngine* engine) {
+    auto token = std::make_shared<TransferEngineShutdownToken>(engine);
+    registerTokenForShutdown(token);
+    return token;
 }
 
-static std::string loadTopologyJsonFile(const std::string &path) {
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        return "";
-    }
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    std::string content = buffer.str();
-    file.close();
-    return content;
+void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
+    if (!token) return;
+    token->detach();
+    token.reset();
 }
 
-int TransferEngine::init(const std::string &metadata_conn_string,
-                         const std::string &local_server_name,
-                         const std::string &ip_or_host_name,
+}  // namespace
+
+TransferEngine::TransferEngine(bool auto_discover)
+    : impl_(std::make_shared<TransferEngineImpl>(auto_discover)) {}
+
+TransferEngine::TransferEngine(bool auto_discover,
+                               const std::vector<std::string>& filter)
+    : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
+
+TransferEngine::TransferEngine(TransferEngine&& other) noexcept
+    : impl_(std::move(other.impl_)),
+      impl_tent_(std::move(other.impl_tent_)),
+      use_tent_(other.use_tent_) {
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+}
+
+TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
+    if (this == &other) return *this;
+    freeEngine();
+    impl_ = std::move(other.impl_);
+    impl_tent_ = std::move(other.impl_tent_);
+    use_tent_ = other.use_tent_;
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+    return *this;
+}
+
+TransferEngine::~TransferEngine() { freeEngine(); }
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
-    TransferMetadata::RpcMetaDesc desc;
-    std::string rpc_binding_method;
-
-    if (!setFilesLimit()) {
-        LOG(WARNING) << "Failed to set file descriptor limit. Continuing "
-                        "initialization, but this may cause issues if too many "
-                        "files are opened.";
-    }
-    // Set resources to the maximum value
-
-#ifdef USE_ASCEND
-    // The only difference in initializing the Ascend Transport is that the
-    // `local_server_name` must include the physical NPU card ID. The format
-    // changes from `ip:port` to `ip:port:npu_x`, e.g., `"0.0.0.0:12345:npu_2"`.
-    // While the desc_name stored in the metadata remains in the format of
-    // ip:port.
-    int devicePhyId = -1;
-    auto [host_name, port] =
-        parseHostNameWithPortAscend(local_server_name, &devicePhyId);
-    LOG(INFO) << "Transfer Engine parseHostNameWithPortAscend. server_name: "
-              << host_name << " port: " << port
-              << " devicePhyId: " << devicePhyId;
-    local_server_name_ = host_name + ":" + std::to_string(port);
-#else
-    auto [host_name, port] = parseHostNameWithPort(local_server_name);
-    LOG(INFO) << "Transfer Engine parseHostNameWithPort. server_name: "
-              << host_name << " port: " << port;
-    local_server_name_ = local_server_name;
-#endif
-
-    if (getenv("MC_LEGACY_RPC_PORT_BINDING") ||
-        metadata_conn_string == P2PHANDSHAKE) {
-        rpc_binding_method = "legacy/P2P";
-        desc.ip_or_host_name = host_name;
-        desc.rpc_port = port;
-        desc.sockfd = -1;
-
-        if (metadata_conn_string == P2PHANDSHAKE) {
-            rpc_binding_method = "P2P handshake";
-            desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-            if (desc.rpc_port == 0) {
-                LOG(ERROR) << "P2P: No valid port found for local TCP service.";
-                return -1;
-            }
-#if defined(USE_ASCEND)
-            // The current version of Ascend Transport does not support IPv6,
-            // but it will be added in a future release.
-            local_server_name_ =
-                desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
-#else
-            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
-                                 std::to_string(desc.rpc_port);
-#endif
-        }
-    } else {
-        rpc_binding_method = "new RPC mapping";
-        (void)(ip_or_host_name);
-        auto *ip_address = getenv("MC_TCP_BIND_ADDRESS");
-        if (ip_address)
-            desc.ip_or_host_name = ip_address;
-        else {
-            auto ip_list = findLocalIpAddresses();
-            if (ip_list.empty()) {
-                LOG(ERROR) << "not valid LAN address found";
-                return -1;
-            } else {
-                desc.ip_or_host_name = ip_list[0];
-            }
-        }
-
-        // In the new rpc port mapping, it is randomly selected to prevent
-        // port conflict
-        (void)(rpc_port);
-        desc.rpc_port = findAvailableTcpPort(desc.sockfd);
-        if (desc.rpc_port == 0) {
-            LOG(ERROR) << "not valid port for serving local TCP service";
-            return -1;
-        }
-    }
-
-    LOG(INFO) << "Transfer Engine RPC using " << rpc_binding_method
-              << ", listening on " << desc.ip_or_host_name << ":"
-              << desc.rpc_port;
-
-    metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
-#ifdef USE_ASCEND
-    std::string mutable_server_name =
-        local_server_name_ + ":npu_" + std::to_string(devicePhyId);
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, mutable_server_name);
-#else
-    multi_transports_ =
-        std::make_shared<MultiTransport>(metadata_, local_server_name_);
-#endif
-    int ret = metadata_->addRpcMetaEntry(local_server_name_, desc);
-    if (ret) return ret;
-
-#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-    Transport *ascend_transport =
-        multi_transports_->installTransport("ascend", local_topology_);
-    if (!ascend_transport) {
-        LOG(ERROR) << "Failed to install Ascend transport";
-        return -1;
-    }
-#else
-
-#if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
-    if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
-        Transport *cxl_transport =
-            multi_transports_->installTransport("cxl", local_topology_);
-        if (!cxl_transport) {
-            LOG(ERROR) << "Failed to install CXL transport";
-            return -1;
-        }
-    }
-#endif
-
-    if (auto_discover_) {
-        LOG(INFO) << "Auto-discovering topology...";
-        if (getenv("MC_CUSTOM_TOPO_JSON")) {
-            auto path = getenv("MC_CUSTOM_TOPO_JSON");
-            LOG(INFO) << "Using custom topology from: " << path;
-            auto topo_json = loadTopologyJsonFile(path);
-            if (!topo_json.empty()) {
-                local_topology_->parse(topo_json);
-            } else {
-                LOG(WARNING) << "Failed to load custom topology from " << path
-                             << ", falling back to auto-detect.";
-                local_topology_->discover(filter_);
-            }
-        } else {
-            local_topology_->discover(filter_);
-        }
-        LOG(INFO) << "Topology discovery complete. Found "
-                  << local_topology_->getHcaList().size() << " HCAs.";
-
-#ifdef USE_ASCEND_HETEROGENEOUS
-        Transport *ascend_transport =
-            multi_transports_->installTransport("ascend", local_topology_);
-        if (!ascend_transport) {
-            LOG(ERROR) << "Failed to install Ascend transport";
-            return -1;
-        }
-#elif defined(USE_MNNVL)
-        if (local_topology_->getHcaList().size() > 0 &&
-            !getenv("MC_FORCE_MNNVL")) {
-            Transport *rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
-                return -1;
-            }
-        } else {
-            Transport *nvlink_transport =
-                multi_transports_->installTransport("nvlink", nullptr);
-            if (!nvlink_transport) {
-                LOG(ERROR) << "Failed to install NVLink transport";
-                return -1;
-            }
-        }
-#else
-        if (local_topology_->getHcaList().size() > 0 &&
-            !getenv("MC_FORCE_TCP")) {
-            // only install RDMA transport when there is at least one HCA
-            Transport *rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
-                return -1;
-            }
-        } else {
-            Transport *tcp_transport =
-                multi_transports_->installTransport("tcp", nullptr);
-            if (!tcp_transport) {
-                LOG(ERROR) << "Failed to install TCP transport";
-                return -1;
-            }
-        }
-#endif
-        // TODO: install other transports automatically
-    }
-#endif
-
-    return 0;
+    return impl_->init(metadata_conn_string, local_server_name, ip_or_host_name,
+                       rpc_port);
 }
 
 int TransferEngine::freeEngine() {
-    if (metadata_) {
-        metadata_->removeRpcMetaEntry(local_server_name_);
-        metadata_.reset();
+    detachShutdownToken(shutdown_token_);
+    if (impl_) {
+        if (impl_.use_count() == 1) impl_->freeEngine();
+        impl_.reset();
     }
     return 0;
 }
 
-// Only for testing
-Transport *TransferEngine::installTransport(const std::string &proto,
-                                            void **args) {
-    Transport *transport = multi_transports_->getTransport(proto);
-    if (transport) {
-        LOG(WARNING) << "Transport " << proto << " already installed";
-        return transport;
-    }
-
-    if (args != nullptr && args[0] != nullptr) {
-        const std::string nic_priority_matrix = static_cast<char *>(args[0]);
-        int ret = local_topology_->parse(nic_priority_matrix);
-        if (ret) {
-            LOG(ERROR) << "Failed to parse NIC priority matrix";
-            return nullptr;
-        }
-    }
-
-    transport = multi_transports_->installTransport(proto, local_topology_);
-    if (!transport) return nullptr;
-
-    // Since installTransport() is only called once during initialization
-    // and is not expected to be executed concurrently, we do not acquire a
-    // shared lock here. If future modifications allow installTransport() to be
-    // invoked concurrently, a std::shared_lock<std::shared_mutex> should be
-    // added to ensure thread safety.
-    for (auto &entry : local_memory_regions_) {
-        int ret = transport->registerLocalMemory(
-            entry.addr, entry.length, entry.location, entry.remote_accessible);
-        if (ret < 0) return nullptr;
-    }
-    return transport;
+Transport* TransferEngine::installTransport(const std::string& proto,
+                                            void** args) {
+    return impl_->installTransport(proto, args);
 }
 
-int TransferEngine::uninstallTransport(const std::string &proto) { return 0; }
-
-int TransferEngine::getRpcPort() { return metadata_->localRpcMeta().rpc_port; }
+int TransferEngine::uninstallTransport(const std::string& proto) {
+    return impl_->uninstallTransport(proto);
+}
 
 std::string TransferEngine::getLocalIpAndPort() {
-    return metadata_->localRpcMeta().ip_or_host_name + ":" +
-           std::to_string(metadata_->localRpcMeta().rpc_port);
+    return impl_->getLocalIpAndPort();
+}
+
+int TransferEngine::getRpcPort() { return impl_->getRpcPort(); }
+
+SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
+    return impl_->openSegment(segment_name);
+}
+
+Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
+    return impl_->CheckSegmentStatus(sid);
+}
+
+int TransferEngine::closeSegment(SegmentHandle handle) {
+    return impl_->closeSegment(handle);
+}
+
+int TransferEngine::removeLocalSegment(const std::string& segment_name) {
+    return impl_->removeLocalSegment(segment_name);
+}
+
+int TransferEngine::registerLocalMemory(void* addr, size_t length,
+                                        const std::string& location,
+                                        bool remote_accessible,
+                                        bool update_metadata) {
+    return impl_->registerLocalMemory(addr, length, location, remote_accessible,
+                                      update_metadata);
+}
+
+int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
+    return impl_->unregisterLocalMemory(addr, update_metadata);
+}
+
+void* TransferEngine::allocateSharedMemory(size_t length) {
+    return impl_->allocateSharedMemory(length);
+}
+
+int TransferEngine::freeSharedMemory(void* addr) {
+    return impl_->freeSharedMemory(addr);
+}
+
+Status TransferEngine::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return impl_->submitTransfer(batch_id, entries);
+}
+
+Status TransferEngine::submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg) {
+    return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
+}
+
+#ifdef ENABLE_MULTI_PROTOCOL
+// Multi-protocol API (only available when ENABLE_MULTI_PROTOCOL is defined)
+int TransferEngine::mp_registerLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    return impl_->mp_registerLocalMemory(buffer_map);
+}
+
+int TransferEngine::mp_unregisterLocalMemory(
+    std::unordered_map<std::string, std::vector<RegisteredBuffer>>&
+        buffer_map) {
+    return impl_->mp_unregisterLocalMemory(buffer_map);
+}
+
+Status TransferEngine::mp_submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    std::string& proto) {
+    return impl_->mp_submitTransfer(batch_id, entries, proto);
+}
+
+Status TransferEngine::mp_submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg, std::string& proto) {
+    return impl_->mp_submitTransferWithNotify(batch_id, entries, notify_msg,
+                                              proto);
+}
+#endif
+
+int TransferEngine::registerLocalMemoryBatch(
+    const std::vector<BufferEntry>& buffer_list, const std::string& location) {
+    return impl_->registerLocalMemoryBatch(buffer_list, location);
+}
+
+int TransferEngine::unregisterLocalMemoryBatch(
+    const std::vector<void*>& addr_list) {
+    return impl_->unregisterLocalMemoryBatch(addr_list);
+}
+
+BatchID TransferEngine::allocateBatchID(size_t batch_size) {
+    return impl_->allocateBatchID(batch_size);
+}
+
+Status TransferEngine::freeBatchID(BatchID batch_id) {
+    return impl_->freeBatchID(batch_id);
 }
 
 int TransferEngine::getNotifies(
-    std::vector<TransferMetadata::NotifyDesc> &notifies) {
-    return metadata_->getNotifies(notifies);
+    std::vector<TransferMetadata::NotifyDesc>& notifies) {
+    return impl_->getNotifies(notifies);
 }
 
 int TransferEngine::sendNotifyByID(SegmentID target_id,
                                    TransferMetadata::NotifyDesc notify_msg) {
-    auto desc = metadata_->getSegmentDescByID(target_id);
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-    return ret;
+    return impl_->sendNotifyByID(target_id, notify_msg);
 }
 
 int TransferEngine::sendNotifyByName(std::string remote_agent,
                                      TransferMetadata::NotifyDesc notify_msg) {
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
-    return ret;
+    return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
 }
 
-Transport::SegmentHandle TransferEngine::openSegment(
-    const std::string &segment_name) {
-    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    std::string trimmed_segment_name = segment_name;
-    while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
-        trimmed_segment_name.erase(0, 1);
-    if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    return metadata_->getSegmentID(trimmed_segment_name);
+PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    return impl_->probePeerAliveByID(target_id) == 0
+               ? PeerLiveness::Alive
+               : PeerLiveness::Unreachable;
 }
 
-int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }
-
-int TransferEngine::removeLocalSegment(const std::string &segment_name) {
-    if (segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    std::string trimmed_segment_name = segment_name;
-    while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
-        trimmed_segment_name.erase(0, 1);
-    if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    return metadata_->removeLocalSegment(trimmed_segment_name);
+Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
+                                         TransferStatus& status) {
+    return impl_->getTransferStatus(batch_id, task_id, status);
 }
 
-bool TransferEngine::checkOverlap(void *addr, uint64_t length) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (auto &local_memory_region : local_memory_regions_) {
-        if (overlap(addr, length, local_memory_region.addr,
-                    local_memory_region.length)) {
-            return true;
+Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
+                                              TransferStatus& status) {
+    return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    return Status::OK();
+}
+
+Transport* TransferEngine::getTransport(const std::string& proto) {
+    return impl_->getTransport(proto);
+}
+
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
+device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
+    return impl_->getOrCreateP2pTransport(num_ranks);
+}
+
+device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    return impl_->getOrCreateRdmaTransport(device_filter);
+}
+#endif
+
+#ifdef USE_NCCL_DEVICE
+device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
+    return impl_->getOrCreateNcclTransport();
+}
+#endif
+
+bool TransferEngine::isTcpOnly() const { return impl_->isTcpOnly(); }
+
+int TransferEngine::syncSegmentCache(const std::string& segment_name) {
+    return impl_->syncSegmentCache(segment_name);
+}
+
+std::shared_ptr<TransferMetadata> TransferEngine::getMetadata() {
+    return impl_->getMetadata();
+}
+
+bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
+    return impl_->checkOverlap(addr, length);
+}
+
+void TransferEngine::setAutoDiscover(bool auto_discover) {
+    impl_->setAutoDiscover(auto_discover);
+}
+
+void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
+    impl_->setAutoDiscover(config);
+}
+
+void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
+
+void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
+    impl_->setWhitelistFilters(std::move(filters));
+}
+
+int TransferEngine::numContexts() const { return impl_->numContexts(); }
+
+std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
+    return impl_->getLocalTopology();
+}
+
+std::string TransferEngine::getLocalTopologyString() {
+    auto topo = impl_->getLocalTopology();
+    return topo ? topo->toString() : "{}";
+}
+
+void TransferEngine::enableGracefulShutdown() {
+    if (!shutdown_token_) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+    }
+    installGracefulShutdownHandlers();
+}
+
+std::string TransferEngine::showLinks(bool json) const {
+    if (!impl_) return "{}";
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
+}
+
+}  // namespace mooncake
+#else
+#include "transfer_engine.h"
+#include "transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
+#include "tent/common/config.h"
+#include "tent/common/types.h"
+#include "tent/runtime/topology.h"
+#include "topology.h"
+
+#include <mutex>
+#include <utility>
+#include "graceful_shutdown.h"
+#include "show_links.h"
+
+namespace mooncake {
+namespace {
+
+class TransferEngineShutdownToken : public ShutdownToken {
+   public:
+    explicit TransferEngineShutdownToken(TransferEngine* engine)
+        : engine_(engine) {}
+
+    void shutdown() override {
+        TransferEngine* engine = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            engine = engine_;
+            engine_ = nullptr;
         }
+        if (engine) engine->freeEngine();
     }
-    return false;
+
+    void detach() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        engine_ = nullptr;
+    }
+
+   private:
+    std::mutex mutex_;
+    TransferEngine* engine_;
+};
+
+std::shared_ptr<ShutdownToken> registerTransferEngineShutdownToken(
+    TransferEngine* engine) {
+    auto token = std::make_shared<TransferEngineShutdownToken>(engine);
+    registerTokenForShutdown(token);
+    return token;
 }
 
-int TransferEngine::registerLocalMemory(void *addr, size_t length,
-                                        const std::string &location,
-                                        bool remote_accessible,
-                                        bool update_metadata) {
-    if (checkOverlap(addr, length)) {
-        LOG(ERROR)
-            << "Transfer Engine does not support overlapped memory region";
-        return ERR_ADDRESS_OVERLAPPED;
-    }
-    if (length == 0) {
-        LOG(ERROR)
-            << "Transfer Engine does not support zero length memory region";
-        return ERR_INVALID_ARGUMENT;
-    }
-    for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemory(
-            addr, length, location, remote_accessible, update_metadata);
-        if (ret < 0) return ret;
-    }
-
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    local_memory_regions_.push_back(
-        {addr, length, location, remote_accessible});
-    return 0;
+void detachShutdownToken(std::shared_ptr<ShutdownToken>& token) {
+    if (!token) return;
+    token->detach();
+    token.reset();
 }
 
-int TransferEngine::unregisterLocalMemory(void *addr, bool update_metadata) {
-    for (auto &transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret) return ret;
-    }
+}  // namespace
 
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto it = local_memory_regions_.begin();
-         it != local_memory_regions_.end(); ++it) {
-        if (it->addr == addr) {
-            local_memory_regions_.erase(it);
-            break;
-        }
+TransferEngine::TransferEngine(bool auto_discover) {
+    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+        use_tent_ = true;
     }
-    return 0;
+    if (!use_tent_) {
+        impl_ = std::make_shared<TransferEngineImpl>(auto_discover);
+    }
 }
 
-int TransferEngine::registerLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list, const std::string &location) {
-    for (auto &buffer : buffer_list) {
-        if (checkOverlap(buffer.addr, buffer.length)) {
-            LOG(ERROR)
-                << "Transfer Engine does not support overlapped memory region";
-            return ERR_ADDRESS_OVERLAPPED;
-        }
+TransferEngine::TransferEngine(bool auto_discover,
+                               const std::vector<std::string>& filter) {
+    if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
+        use_tent_ = true;
     }
-    for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->registerLocalMemoryBatch(buffer_list, location);
-        if (ret < 0) return ret;
+    if (!use_tent_) {
+        impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
     }
-
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto &buffer : buffer_list) {
-        local_memory_regions_.push_back(
-            {buffer.addr, buffer.length, location, true});
-    }
-    return 0;
 }
 
-int TransferEngine::unregisterLocalMemoryBatch(
-    const std::vector<void *> &addr_list) {
-    for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemoryBatch(addr_list);
-        if (ret < 0) return ret;
+TransferEngine::TransferEngine(TransferEngine&& other) noexcept
+    : impl_(std::move(other.impl_)),
+      impl_tent_(std::move(other.impl_tent_)),
+      shutdown_token_(nullptr),
+      use_tent_(other.use_tent_) {
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
     }
-
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto &addr : addr_list) {
-        for (auto it = local_memory_regions_.begin();
-             it != local_memory_regions_.end(); ++it) {
-            if (it->addr == addr) {
-                local_memory_regions_.erase(it);
-                break;
-            }
-        }
-    }
-    return 0;
 }
 
-#ifdef WITH_METRICS
-// Helper function to convert string to lowercase for case-insensitive
-// comparison
-static std::string toLower(const std::string &s) {
-    std::string result = s;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
+    if (this == &other) return *this;
+    freeEngine();
+    impl_ = std::move(other.impl_);
+    impl_tent_ = std::move(other.impl_tent_);
+    use_tent_ = other.use_tent_;
+    const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
+    detachShutdownToken(other.shutdown_token_);
+    if (shutdown_enabled) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+        installGracefulShutdownHandlers();
+    }
+    return *this;
+}
+
+TransferEngine::~TransferEngine() { freeEngine(); }
+
+static std::pair<std::string, std::string> parseConnectionStringInternal(
+    const std::string& conn_string) {
+    std::pair<std::string, std::string> result;
+    std::string proto = "etcd";
+    std::string domain;
+    std::size_t pos = conn_string.find("://");
+
+    if (pos != std::string::npos) {
+        proto = conn_string.substr(0, pos);
+        domain = conn_string.substr(pos + 3);
+    } else if (conn_string == P2PHANDSHAKE) {
+        proto = "";
+        domain = P2PHANDSHAKE;
+    } else {
+        domain = conn_string;
+    }
+
+    result.first = proto;
+    result.second = domain;
     return result;
 }
 
-void TransferEngine::InitializeMetricsConfig() {
-    // Check if metrics reporting is enabled via environment variable
-    const char *metric_env = getenv("MC_TE_METRIC");
-    if (metric_env) {
-        std::string value = toLower(metric_env);
-        metrics_enabled_ = (value == "1" || value == "true" || value == "yes" ||
-                            value == "on");
-    }
-
-    // Check for custom reporting interval
-    const char *interval_env = getenv("MC_TE_METRIC_INTERVAL_SECONDS");
-    if (interval_env) {
-        try {
-            int interval = std::stoi(interval_env);
-            if (interval > 0) {
-                metrics_interval_seconds_ = static_cast<uint64_t>(interval);
-                LOG(INFO) << "Metrics reporting interval set to "
-                          << metrics_interval_seconds_ << " seconds";
-            } else {
-                LOG(WARNING)
-                    << "Invalid MC_TE_METRIC_INTERVAL_SECONDS value: "
-                    << interval_env << ", must be positive. Using default: "
-                    << metrics_interval_seconds_;
-            }
-        } catch (const std::exception &e) {
-            LOG(WARNING) << "Failed to parse MC_TE_METRIC_INTERVAL_SECONDS: "
-                         << interval_env
-                         << ", using default: " << metrics_interval_seconds_;
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name,
+                         uint64_t rpc_port) {
+    if (!use_tent_) {
+        return impl_->init(metadata_conn_string, local_server_name,
+                           ip_or_host_name, rpc_port);
+    } else {
+        auto config = std::make_shared<mooncake::tent::Config>();
+        if (!local_server_name.empty())
+            config->set("local_segment_name", local_server_name);
+        if (metadata_conn_string == P2PHANDSHAKE) {
+            config->set("metadata_type", "p2p");
+        } else {
+            auto [type, servers] =
+                parseConnectionStringInternal(metadata_conn_string);
+            if (!type.empty()) config->set("metadata_type", type);
+            if (!servers.empty()) config->set("metadata_servers", servers);
         }
+        impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
+        return impl_tent_->available() ? 0 : 1;
     }
 }
 
-void TransferEngine::StartMetricsReportingThread() {
-    // Only start the metrics thread if metrics are enabled
-    if (!metrics_enabled_) {
-        LOG(INFO)
-            << "Metrics reporting is disabled (set MC_TE_METRIC=1 to enable)";
-        return;
+int TransferEngine::freeEngine() {
+    detachShutdownToken(shutdown_token_);
+    if (!use_tent_ && impl_) {
+        if (impl_.use_count() == 1) impl_->freeEngine();
+        impl_.reset();
+    } else {
+        impl_tent_.reset();
+    }
+    return 0;
+}
+
+Transport* TransferEngine::installTransport(const std::string& proto,
+                                            void** args) {
+    if (use_tent_) {
+        static bool g_present = false;
+        if (!g_present) {
+            LOG(INFO) << "installTransport not used by TENT";
+            g_present = true;
+        }
+        return nullptr;
+    } else {
+        return impl_->installTransport(proto, args);
+    }
+}
+
+int TransferEngine::uninstallTransport(const std::string& proto) {
+    if (use_tent_)
+        return 0;
+    else
+        return impl_->uninstallTransport(proto);
+}
+
+std::string TransferEngine::getLocalIpAndPort() {
+    if (use_tent_) {
+        return impl_tent_->getRpcServerAddress() + ":" +
+               std::to_string(impl_tent_->getRpcServerPort());
+    } else
+        return impl_->getLocalIpAndPort();
+}
+
+int TransferEngine::getRpcPort() {
+    if (use_tent_) {
+        return impl_tent_->getRpcServerPort();
+    } else
+        return impl_->getRpcPort();
+}
+
+SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
+    if (use_tent_) {
+        SegmentHandle handle;
+        auto status = impl_tent_->openSegment(handle, segment_name);
+        if (!status.ok())
+            return static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT);
+        return handle;
+    } else
+        return impl_->openSegment(segment_name);
+}
+
+Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
+    if (use_tent_)
+        return Status::OK();
+    else
+        return impl_->CheckSegmentStatus(sid);
+}
+
+int TransferEngine::closeSegment(SegmentHandle handle) {
+    if (use_tent_) {
+        auto status = impl_tent_->closeSegment(handle);
+        return (int)status.code();
+    } else
+        return impl_->closeSegment(handle);
+}
+
+int TransferEngine::removeLocalSegment(const std::string& segment_name) {
+    if (use_tent_)
+        return 0;
+    else
+        return impl_->removeLocalSegment(segment_name);
+}
+
+int TransferEngine::registerLocalMemory(void* addr, size_t length,
+                                        const std::string& location,
+                                        bool remote_accessible,
+                                        bool update_metadata) {
+    if (use_tent_) {
+        mooncake::tent::MemoryOptions option;
+        if (!location.empty() && location != kWildcardLocation)
+            option.location = location;
+        auto status = impl_tent_->registerLocalMemory(addr, length, option);
+        return (int)status.code();
+    } else
+        return impl_->registerLocalMemory(addr, length, location,
+                                          remote_accessible, update_metadata);
+}
+
+int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
+    if (use_tent_) {
+        auto status = impl_tent_->unregisterLocalMemory(addr);
+        return (int)status.code();
+    } else
+        return impl_->unregisterLocalMemory(addr, update_metadata);
+}
+
+void* TransferEngine::allocateSharedMemory(size_t length) {
+    if (use_tent_) {
+        LOG(WARNING) << "allocateSharedMemory is classic TE only; use TENT "
+                        "allocateLocalMemory with SHM enabled";
+        return nullptr;
+    }
+    return impl_->allocateSharedMemory(length);
+}
+
+int TransferEngine::freeSharedMemory(void* addr) {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->freeSharedMemory(addr);
+}
+
+int TransferEngine::registerLocalMemoryBatch(
+    const std::vector<BufferEntry>& buffer_list, const std::string& location) {
+    if (use_tent_) {
+        mooncake::tent::MemoryOptions option;
+        if (!location.empty() && location != kWildcardLocation)
+            option.location = location;
+        std::vector<void*> addr_list;
+        std::vector<size_t> size_list;
+        for (auto& buffer : buffer_list) {
+            addr_list.push_back(buffer.addr);
+            size_list.push_back(buffer.length);
+        }
+        auto status =
+            impl_tent_->registerLocalMemory(addr_list, size_list, option);
+        return (int)status.code();
+    } else {
+        return impl_->registerLocalMemoryBatch(buffer_list, location);
+    }
+}
+
+int TransferEngine::unregisterLocalMemoryBatch(
+    const std::vector<void*>& addr_list) {
+    if (use_tent_) {
+        auto status = impl_tent_->unregisterLocalMemory(addr_list);
+        return (int)status.code();
+    } else {
+        return impl_->unregisterLocalMemoryBatch(addr_list);
+    }
+}
+
+BatchID TransferEngine::allocateBatchID(size_t batch_size) {
+    if (use_tent_) {
+        const auto batch_id = impl_tent_->allocateBatch(batch_size);
+        return batch_id == 0 ? INVALID_BATCH_ID : batch_id;
+    } else {
+        return impl_->allocateBatchID(batch_size);
+    }
+}
+
+Status TransferEngine::freeBatchID(BatchID batch_id) {
+    if (use_tent_) {
+        auto status = impl_tent_->freeBatch(batch_id);
+        if (!status.ok())
+            return Status::Context(status.ToString());
+        else
+            return Status::OK();
+    } else {
+        return impl_->freeBatchID(batch_id);
+    }
+}
+
+Status TransferEngine::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    if (use_tent_) {
+        std::vector<mooncake::tent::Request> requests;
+        for (auto& item : entries) {
+            mooncake::tent::Request req;
+            req.opcode = (mooncake::tent::Request::OpCode)(int)item.opcode;
+            req.length = item.length;
+            req.source = item.source;
+            req.target_id = item.target_id;
+            req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
+            requests.push_back(req);
+        }
+        auto status = impl_tent_->submitTransfer(batch_id, requests);
+        if (!status.ok())
+            return Status::Context(status.ToString());
+        else
+            return Status::OK();
+    } else {
+        return impl_->submitTransfer(batch_id, entries);
+    }
+}
+
+Status TransferEngine::submitTransferWithNotify(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    TransferMetadata::NotifyDesc notify_msg) {
+    if (use_tent_) {
+        std::vector<mooncake::tent::Request> requests;
+        for (auto& item : entries) {
+            mooncake::tent::Request req;
+            req.opcode = (mooncake::tent::Request::OpCode)(int)item.opcode;
+            req.length = item.length;
+            req.source = item.source;
+            req.target_id = item.target_id;
+            req.target_offset = item.target_offset;
+            req.transport_hint =
+                mooncake::tent::c_to_transport_hint(item.transport_hint);
+            requests.push_back(req);
+        }
+        mooncake::tent::Notification notifi;
+        notifi.name = notify_msg.name;
+        notifi.msg = notify_msg.notify_msg;
+        auto status = impl_tent_->submitTransfer(batch_id, requests, notifi);
+        if (!status.ok())
+            return Status::Context(status.ToString());
+        else
+            return Status::OK();
+    } else {
+        return impl_->submitTransferWithNotify(batch_id, entries, notify_msg);
+    }
+}
+
+int TransferEngine::getNotifies(
+    std::vector<TransferMetadata::NotifyDesc>& notifies) {
+    if (use_tent_) {
+        std::vector<mooncake::tent::Notification> notifi_list;
+        auto status = impl_tent_->receiveNotification(notifi_list);
+        for (auto& entry : notifi_list) {
+            TransferMetadata::NotifyDesc desc;
+            desc.name = entry.name;
+            desc.notify_msg = entry.msg;
+            notifies.push_back(desc);
+        }
+        return (int)status.code();
+    } else
+        return impl_->getNotifies(notifies);
+}
+
+int TransferEngine::sendNotifyByID(SegmentID target_id,
+                                   TransferMetadata::NotifyDesc notify_msg) {
+    if (use_tent_) {
+        mooncake::tent::Notification notifi;
+        notifi.name = notify_msg.name;
+        notifi.msg = notify_msg.notify_msg;
+        auto status = impl_tent_->sendNotification(target_id, notifi);
+        return (int)status.code();
+    } else
+        return impl_->sendNotifyByID(target_id, notify_msg);
+}
+
+int TransferEngine::sendNotifyByName(std::string remote_agent,
+                                     TransferMetadata::NotifyDesc notify_msg) {
+    if (use_tent_) {
+        mooncake::tent::Notification notifi;
+        notifi.name = notify_msg.name;
+        notifi.msg = notify_msg.notify_msg;
+        SegmentHandle handle;
+        auto status = impl_tent_->openSegment(handle, remote_agent);
+        if (!status.ok()) return (int)status.code();
+        status = impl_tent_->sendNotification(handle, notifi);
+        impl_tent_->closeSegment(handle);
+        return (int)status.code();
+    } else
+        return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
+}
+
+PeerLiveness TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    if (use_tent_) {
+        auto status = impl_tent_->probePeerAliveByID(target_id);
+        return status.ok() ? PeerLiveness::Alive : PeerLiveness::Unreachable;
+    }
+    return impl_->probePeerAliveByID(target_id) == 0
+               ? PeerLiveness::Alive
+               : PeerLiveness::Unreachable;
+}
+
+Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
+                                         TransferStatus& status) {
+    if (use_tent_) {
+        mooncake::tent::TransferStatus tent_status;
+        auto s = impl_tent_->getTransferStatus(batch_id, task_id, tent_status);
+        status.s = (TransferStatusEnum)(int)tent_status.s;
+        status.transferred_bytes = tent_status.transferred_bytes;
+        if (!s.ok())
+            return Status::Context(s.ToString());
+        else
+            return Status::OK();
+    } else {
+        return impl_->getTransferStatus(batch_id, task_id, status);
+    }
+}
+
+Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
+                                              TransferStatus& status) {
+    if (use_tent_) {
+        mooncake::tent::TransferStatus tent_status;
+        auto s = impl_tent_->getTransferStatus(batch_id, tent_status);
+        status.s = (TransferStatusEnum)(int)tent_status.s;
+        status.transferred_bytes = tent_status.transferred_bytes;
+        if (!s.ok())
+            return Status::Context(s.ToString());
+        else
+            return Status::OK();
+    } else
+        return impl_->getBatchTransferStatus(batch_id, status);
+}
+
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    if (use_tent_) {
+        std::vector<mooncake::tent::NicLoadStats> tent_stats;
+        auto status = impl_tent_->getNicLoadStats(tent_stats);
+        if (!status.ok()) return Status::Context(status.ToString());
+        stats.reserve(tent_stats.size());
+        for (const auto& stat : tent_stats) {
+            NicLoadStats load_stats;
+            load_stats.device_name = stat.device_name;
+            load_stats.inflight_bytes = stat.inflight_bytes;
+            load_stats.ewma_bandwidth_bps = stat.ewma_bandwidth_bps;
+            stats.push_back(load_stats);
+        }
+    }
+    return Status::OK();
+}
+
+Transport* TransferEngine::getTransport(const std::string& proto) {
+    if (use_tent_)
+        return nullptr;
+    else
+        return impl_->getTransport(proto);
+}
+
+#if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
+    !defined(USE_CXI)
+device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateP2pTransport(num_ranks);
+}
+
+device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
+    const std::vector<std::string>& device_filter) {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateRdmaTransport(device_filter);
+}
+#endif
+
+#ifdef USE_NCCL_DEVICE
+device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateNcclTransport();
+}
+#endif
+
+bool TransferEngine::isTcpOnly() const {
+    if (use_tent_)
+        // TENT already rejects TCP loopback transfers when MC_STORE_MEMCPY
+        // is disabled, so auto-enabling memcpy is unnecessary in TENT mode.
+        return false;
+    else
+        return impl_->isTcpOnly();
+}
+
+int TransferEngine::syncSegmentCache(const std::string& segment_name) {
+    if (use_tent_)
+        return 0;
+    else
+        return impl_->syncSegmentCache(segment_name);
+}
+
+std::shared_ptr<TransferMetadata> TransferEngine::getMetadata() {
+    if (use_tent_) {
+        LOG(WARNING) << "API deprecated in Mooncake TENT";
+        return nullptr;
+    } else
+        return impl_->getMetadata();
+}
+
+bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
+    if (!use_tent_) return impl_->checkOverlap(addr, length);
+    return false;
+}
+
+void TransferEngine::setAutoDiscover(bool auto_discover) {
+    if (!use_tent_) impl_->setAutoDiscover(auto_discover);
+}
+
+void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
+    if (!use_tent_) impl_->setAutoDiscover(config);
+}
+
+void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
+    if (!use_tent_) impl_->setWhitelistFilters(std::move(filters));
+}
+
+int TransferEngine::numContexts() const {
+    if (use_tent_)
+        return 1;  // placeholder
+    else
+        return impl_->numContexts();
+}
+
+std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
+    if (use_tent_) {
+        // Classic Topology only supports a 2-tier priority matrix. Prefer
+        // getLocalTopologyString() for the full TENT nics/mems (rank0/1/2)
+        // representation. This method still projects into the classic format
+        // for existing C++ callers.
+        auto classic = std::make_shared<Topology>();
+        if (!impl_tent_ || !impl_tent_->available()) return classic;
+        auto tent_topo = impl_tent_->getLocalTopology();
+        if (!tent_topo) return classic;
+
+        Json::Value root(Json::objectValue);
+        for (size_t mi = 0; mi < tent_topo->getMemCount(); ++mi) {
+            const auto* mem =
+                tent_topo->getMemEntry(static_cast<tent::Topology::MemID>(mi));
+            if (!mem) continue;
+            if (mem->name.empty() || mem->name == tent::kWildcardLocation) {
+                continue;
+            }
+            Json::Value preferred(Json::arrayValue);
+            Json::Value avail(Json::arrayValue);
+            for (auto id : mem->device_list[0]) {
+                preferred.append(tent_topo->getNicName(id));
+            }
+            for (size_t rank = 1; rank < tent::Topology::DevicePriorityRanks;
+                 ++rank) {
+                for (auto id : mem->device_list[rank]) {
+                    avail.append(tent_topo->getNicName(id));
+                }
+            }
+            Json::Value entry(Json::arrayValue);
+            entry.append(preferred);
+            entry.append(avail);
+            root[mem->name] = entry;
+        }
+
+        Json::StreamWriterBuilder builder;
+        builder["indentation"] = "";
+        const std::string json = Json::writeString(builder, root);
+        if (classic->parse(json)) {
+            LOG(WARNING) << "Failed to translate TENT topology to classic "
+                            "priority matrix";
+            classic->clear();
+        }
+        return classic;
+    } else {
+        return impl_->getLocalTopology();
+    }
+}
+
+std::string TransferEngine::getLocalTopologyString() {
+    if (use_tent_) {
+        if (!impl_tent_ || !impl_tent_->available()) return "{}";
+        return impl_tent_->getLocalTopologyString();
+    }
+    auto topo = impl_ ? impl_->getLocalTopology() : nullptr;
+    return topo ? topo->toString() : "{}";
+}
+
+void* TransferEngine::getBaseAddr() {
+    if (use_tent_) {
+        // TENT version does not support CXL base address
+        return nullptr;
+    } else
+        return impl_->getBaseAddr();
+}
+
+void TransferEngine::enableGracefulShutdown() {
+    if (!shutdown_token_) {
+        shutdown_token_ = registerTransferEngineShutdownToken(this);
+    }
+    installGracefulShutdownHandlers();
+}
+
+std::string TransferEngine::showLinks(bool json) const {
+    if (use_tent_ || !impl_) {
+        return json ? "{}" : "(TENT mode or not initialized)";
+    }
+    return json ? buildShowLinksJson(impl_.get())
+                : buildShowLinksReadable(impl_.get());
+}
+
+}  // namespace mooncake
+#endif
+
+namespace mooncake {
+
+class TransferEngine::ScatterTransferOperation::Impl {
+   public:
+    struct Backend {
+        std::shared_ptr<TransferEngineImpl> legacy;
+#ifdef USE_TENT
+        std::shared_ptr<mooncake::tent::TransferEngine> tent;
+#endif
+    };
+
+    Impl(TransferEngine& engine, Backend backend,
+         const std::vector<ScatterTransferRange>& ranges)
+        : backend_(std::move(backend)) {
+        callbacks_.reserve(ranges.size());
+        size_t fragment_count = 0;
+        for (const auto& range : ranges) {
+            callbacks_.push_back(range.on_fragment_complete);
+            fragment_count += range.lengths.size();
+        }
+        requests_.reserve(fragment_count);
+        request_fragments_.reserve(fragment_count);
+        build(engine, ranges);
     }
 
-    should_stop_metrics_thread_ = false;
-    metrics_reporting_thread_ = std::thread([this]() {
-        LOG(INFO) << "Metrics reporting thread started (interval: "
-                  << metrics_interval_seconds_ << "s)";
-        constexpr double kBytesPerMegabyte = 1024.0 * 1024.0;
+    ~Impl() { wait(); }
 
-        while (!should_stop_metrics_thread_) {
-            // Sleep for the interval, checking periodically for stop signal
-            for (uint64_t i = 0;
-                 i < metrics_interval_seconds_ && !should_stop_metrics_thread_;
-                 ++i) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+    Status wait() {
+        while (!completed_) {
+            poll();
+            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+        }
+        return aggregate_status_;
+    }
+
+    Status waitFor(std::chrono::nanoseconds timeout) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto until_max =
+            std::chrono::steady_clock::time_point::max() - now;
+        const auto max_timeout =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(until_max);
+        auto deadline = now;
+        if (timeout > std::chrono::nanoseconds::zero()) {
+            deadline = timeout >= max_timeout
+                           ? std::chrono::steady_clock::time_point::max()
+                           : now + timeout;
+        }
+        while (!completed_) {
+            poll();
+            if (completed_) break;
+            if (std::chrono::steady_clock::now() >= deadline)
+                return Status::Clock("scatter transfer wait timed out");
+            std::this_thread::sleep_for(kPollInterval);
+        }
+        return aggregate_status_;
+    }
+
+   private:
+    static constexpr auto kPollInterval = std::chrono::microseconds(10);
+
+    bool useTent() const {
+#ifdef USE_TENT
+        return static_cast<bool>(backend_.tent);
+#else
+        return false;
+#endif
+    }
+
+    int closeSegment(SegmentHandle handle) {
+#ifdef USE_TENT
+        if (backend_.tent)
+            return static_cast<int>(backend_.tent->closeSegment(handle).code());
+#endif
+        return backend_.legacy->closeSegment(handle);
+    }
+
+    Status getStatus(BatchID batch_id, size_t task_id, TransferStatus& status) {
+#ifdef USE_TENT
+        if (backend_.tent) {
+            mooncake::tent::TransferStatus tent_status;
+            auto result = backend_.tent->getTransferStatus(batch_id, task_id,
+                                                           tent_status);
+            if (!result.ok()) return Status::Context(result.ToString());
+            status.s = static_cast<TransferStatusEnum>(tent_status.s);
+            status.transferred_bytes = tent_status.transferred_bytes;
+            return Status::OK();
+        }
+#endif
+        return backend_.legacy->getTransferStatus(batch_id, task_id, status);
+    }
+
+    Status freeBatch(BatchID batch_id) {
+#ifdef USE_TENT
+        if (backend_.tent) {
+            auto result = backend_.tent->freeBatch(batch_id);
+            return result.ok() ? Status::OK()
+                               : Status::Context(result.ToString());
+        }
+#endif
+        return backend_.legacy->freeBatchID(batch_id);
+    }
+
+    void remember(const Status& status) {
+        if (aggregate_status_.ok() && !status.ok()) aggregate_status_ = status;
+    }
+
+    Status closeSegments(Status status) {
+        for (const auto& entry : segment_handles_) {
+            if (entry.second ==
+                static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+                continue;
+            if (closeSegment(entry.second) != 0 && status.ok())
+                status =
+                    Status::Context("failed to close scatter transfer segment");
+        }
+        segment_handles_.clear();
+        return status;
+    }
+
+    void finish() {
+        aggregate_status_ = closeSegments(aggregate_status_);
+        completed_ = true;
+        callbacks_.clear();
+        requests_.clear();
+        request_fragments_.clear();
+        done_.clear();
+        task_sizes_.clear();
+        backend_ = {};
+    }
+
+    void complete(size_t range_index, size_t fragment_index,
+                  const Status& status) {
+        remember(status);
+        const auto& callback = callbacks_[range_index];
+        if (!callback) return;
+        try {
+            callback(fragment_index, status);
+        } catch (...) {
+            LOG(ERROR) << "scatter transfer callback failed";
+            remember(Status::Context("scatter transfer callback failed"));
+        }
+    }
+
+    void completeRequest(size_t request_index, const Status& status) {
+        const auto [range_index, fragment_index] =
+            request_fragments_[request_index];
+        done_[request_index] = true;
+        complete(range_index, fragment_index, status);
+    }
+
+    void failPending(const Status& status) {
+        for (size_t i = 0; i < request_fragments_.size(); ++i) {
+            if (!done_[i]) completeRequest(i, status);
+        }
+        remaining_ = 0;
+    }
+
+    void requestAbort(const Status& status) {
+        remember(status);
+        if (abort_requested_) return;
+        abort_requested_ = true;
+#ifdef USE_TENT
+        if (!backend_.tent) return;
+        for (size_t i = 0; i < requests_.size(); ++i) {
+            if (done_[i]) continue;
+            auto cancel_status = backend_.tent->cancelTransfer(batch_id_, i);
+            if (!cancel_status.ok() && !cancel_status.IsNotImplemented()) {
+                LOG(WARNING) << "failed to cancel scatter transfer task " << i
+                             << ": " << cancel_status.ToString();
             }
+        }
+#endif
+    }
 
-            if (should_stop_metrics_thread_) {
-                break;  // Exit if stopped during sleep
-            }
-
-            auto bytes_transferred_in_interval =
-                transferred_bytes_counter_.value();
-            transferred_bytes_counter_
-                .reset();  // Reset counter for the next interval
-
-            if (bytes_transferred_in_interval == 0) {
+    void build(TransferEngine& engine,
+               const std::vector<ScatterTransferRange>& ranges) {
+        for (size_t range_index = 0; range_index < ranges.size();
+             ++range_index) {
+            const auto& range = ranges[range_index];
+            const size_t fragment_count = range.local_offsets.size();
+            SegmentHandle* segment_handle = nullptr;
+            if (range.remote_offsets.size() != fragment_count ||
+                range.lengths.size() != fragment_count ||
+                range.local_buffer == nullptr || range.remote_segment.empty()) {
+                const auto status =
+                    Status::InvalidArgument("invalid scatter transfer range");
+                remember(status);
+                for (size_t i = 0; i < fragment_count; ++i)
+                    complete(range_index, i, status);
                 continue;
             }
 
-            // Calculate throughput in MB/s for better readability
-            double throughput_megabytes_per_second =
-                static_cast<double>(bytes_transferred_in_interval) /
-                (metrics_interval_seconds_ * kBytesPerMegabyte);
+            for (size_t fragment_index = 0; fragment_index < fragment_count;
+                 ++fragment_index) {
+                const size_t length = range.lengths[fragment_index];
+                const size_t local_offset = range.local_offsets[fragment_index];
+                const size_t remote_offset =
+                    range.remote_offsets[fragment_index];
+                if (local_offset > range.local_capacity ||
+                    length > range.local_capacity - local_offset ||
+                    remote_offset > range.remote_size ||
+                    length > range.remote_size - remote_offset ||
+                    range.remote_base_offset >
+                        std::numeric_limits<uint64_t>::max() - remote_offset ||
+                    length > std::numeric_limits<uint64_t>::max() -
+                                 (range.remote_base_offset + remote_offset)) {
+                    complete(range_index, fragment_index,
+                             Status::InvalidArgument(
+                                 "invalid scatter transfer fragment"));
+                    continue;
+                }
 
-            LOG(INFO) << "[Metrics] Transfer Engine Throughput: " << std::fixed
-                      << std::setprecision(2) << throughput_megabytes_per_second
-                      << " MB/s (over last " << metrics_interval_seconds_
-                      << "s)";
+                if (length == 0) {
+                    complete(range_index, fragment_index, Status::OK());
+                    continue;
+                }
+
+                if (!segment_handle) {
+                    auto [segment, inserted] = segment_handles_.emplace(
+                        range.remote_segment,
+                        static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
+                    if (inserted)
+                        segment->second =
+                            engine.openSegment(range.remote_segment);
+                    segment_handle = &segment->second;
+                }
+                if (*segment_handle ==
+                    static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
+                    complete(range_index, fragment_index,
+                             Status::InvalidArgument(
+                                 "failed to open scatter transfer segment"));
+                    continue;
+                }
+
+                requests_.push_back(TransferRequest{
+                    .opcode = range.opcode,
+                    .source =
+                        static_cast<char*>(range.local_buffer) + local_offset,
+                    .target_id = *segment_handle,
+                    .target_offset = range.remote_base_offset + remote_offset,
+                    .length = length,
+                    .task_group_id = 1,
+                });
+                request_fragments_.emplace_back(range_index, fragment_index);
+            }
         }
-        LOG(INFO) << "Metrics reporting thread stopped";
-    });
+
+        if (requests_.empty()) {
+            finish();
+            return;
+        }
+
+        done_.assign(requests_.size(), false);
+        Status submit_status = Status::OK();
+        if (useTent()) {
+            task_sizes_.assign(requests_.size(), 1);
+            batch_id_ = engine.allocateBatchID(requests_.size());
+            if (batch_id_ != INVALID_BATCH_ID)
+                submit_status = engine.submitTransfer(batch_id_, requests_);
+        } else {
+            MultiTransport::ScatterSubmission submission;
+            submit_status =
+                backend_.legacy->submitScatter(requests_, submission);
+            batch_id_ = submission.batch_id;
+            task_sizes_ = std::move(submission.task_sizes);
+        }
+        remaining_ = task_sizes_.size();
+        if (batch_id_ == INVALID_BATCH_ID) {
+            failPending(submit_status.ok()
+                            ? Status::InvalidArgument(
+                                  "failed to allocate scatter transfer batch")
+                            : submit_status);
+            finish();
+            return;
+        }
+
+        if (submit_status.ok()) return;
+
+#ifdef USE_TENT
+        if (backend_.tent) {
+            // TENT prepare failures publish no task slots, while committed
+            // submissions publish all slots and report transport failures in
+            // task status. On a live batch, task 0 being out of range thus
+            // identifies the unpublished case.
+            mooncake::tent::TransferStatus status;
+            auto probe = backend_.tent->getTransferStatus(batch_id_, 0, status);
+            if (probe.ok() || !probe.IsInvalidArgument()) {
+                requestAbort(submit_status);
+                return;
+            }
+            remember(submit_status);
+            remember(freeBatch(batch_id_));
+            batch_id_ = INVALID_BATCH_ID;
+            failPending(submit_status);
+            finish();
+            return;
+        }
+#endif
+
+        requestAbort(submit_status);
+        // Published tasks own the exact fragment results, even when submit
+        // itself reports an error. Poll them to physical completion.
+        if (!task_sizes_.empty()) return;
+        remember(freeBatch(batch_id_));
+        batch_id_ = INVALID_BATCH_ID;
+        failPending(submit_status);
+        finish();
+    }
+
+    void poll() {
+        size_t request_index = 0;
+        for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
+            const size_t request_start = request_index;
+            request_index += task_sizes_[task_id];
+            if (done_[request_start]) continue;
+            TransferStatus status;
+            auto result = getStatus(batch_id_, task_id, status);
+            if (!result.ok()) {
+                requestAbort(result);
+                continue;
+            }
+
+            if (!useTent() && status.s == TransferStatusEnum::FAILED &&
+                task_sizes_[task_id] > 1) {
+                std::vector<TransferStatusEnum> request_statuses;
+                auto detail_status = backend_.legacy->getScatterRequestStatuses(
+                    batch_id_, task_id, request_statuses);
+                if (detail_status.ok() &&
+                    request_statuses.size() == task_sizes_[task_id]) {
+                    for (size_t i = request_start; i < request_index; ++i) {
+                        const auto fragment_status =
+                            request_statuses[i - request_start] ==
+                                    TransferStatusEnum::COMPLETED
+                                ? Status::OK()
+                                : Status::Socket(
+                                      "scatter transfer fragment failed");
+                        if (!fragment_status.ok())
+                            requestAbort(fragment_status);
+                        completeRequest(i, fragment_status);
+                    }
+                    --remaining_;
+                    continue;
+                }
+                remember(detail_status.ok()
+                             ? Status::Context(
+                                   "invalid grouped scatter status count")
+                             : detail_status);
+            }
+
+            Status fragment_status;
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                fragment_status = Status::OK();
+            } else if (status.s == TransferStatusEnum::WAITING ||
+                       status.s == TransferStatusEnum::PENDING) {
+                continue;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                fragment_status =
+                    Status::Socket("scatter transfer fragment timed out");
+                requestAbort(fragment_status);
+                if (!useTent()) continue;
+            } else {
+                fragment_status =
+                    Status::Socket("scatter transfer fragment failed");
+            }
+            if (!fragment_status.ok()) requestAbort(fragment_status);
+            for (size_t i = request_start; i < request_index; ++i)
+                completeRequest(i, fragment_status);
+            --remaining_;
+        }
+        assert(request_index == requests_.size());
+
+        if (remaining_ != 0) return;
+        auto free_status = freeBatch(batch_id_);
+        if (free_status.IsBatchBusy()) return;
+        remember(free_status);
+        batch_id_ = INVALID_BATCH_ID;
+        finish();
+    }
+
+    Backend backend_;
+    std::vector<TransferRequest> requests_;
+    std::vector<std::pair<size_t, size_t>> request_fragments_;
+    std::vector<std::function<void(size_t, const Status&)>> callbacks_;
+    std::unordered_map<std::string, SegmentHandle> segment_handles_;
+    std::vector<uint8_t> done_;
+    std::vector<size_t> task_sizes_;
+    BatchID batch_id_ = INVALID_BATCH_ID;
+    size_t remaining_ = 0;
+    Status aggregate_status_;
+    bool abort_requested_ = false;
+    bool completed_ = false;
+};
+
+TransferEngine::ScatterTransferOperation::ScatterTransferOperation(
+    std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+TransferEngine::ScatterTransferOperation::ScatterTransferOperation(
+    ScatterTransferOperation&&) noexcept = default;
+
+TransferEngine::ScatterTransferOperation&
+TransferEngine::ScatterTransferOperation::operator=(
+    ScatterTransferOperation&&) noexcept = default;
+
+TransferEngine::ScatterTransferOperation::~ScatterTransferOperation() = default;
+
+Status TransferEngine::ScatterTransferOperation::wait() {
+    return impl_
+               ? impl_->wait()
+               : Status::InvalidArgument("invalid scatter transfer operation");
 }
 
-void TransferEngine::StopMetricsReportingThread() {
-    should_stop_metrics_thread_ = true;  // Signal the thread to stop
-    if (metrics_reporting_thread_.joinable()) {
-        LOG(INFO) << "Waiting for metrics reporting thread to join...";
-        metrics_reporting_thread_.join();  // Wait for the thread to finish
-        LOG(INFO) << "Metrics reporting thread joined";
-    }
+Status TransferEngine::ScatterTransferOperation::waitFor(
+    std::chrono::nanoseconds timeout) {
+    return impl_
+               ? impl_->waitFor(timeout)
+               : Status::InvalidArgument("invalid scatter transfer operation");
 }
+
+TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
+    const std::vector<ScatterTransferRange>& ranges) {
+    ScatterTransferOperation::Impl::Backend backend;
+    backend.legacy = impl_;
+#ifdef USE_TENT
+    backend.tent = impl_tent_;
 #endif
+
+    return ScatterTransferOperation(
+        std::make_unique<ScatterTransferOperation::Impl>(
+            *this, std::move(backend), ranges));
+}
+
+Status TransferEngine::transferScatter(
+    const std::vector<ScatterTransferRange>& ranges) {
+    auto operation = submitScatter(ranges);
+    return operation.wait();
+}
 
 }  // namespace mooncake

@@ -2,13 +2,18 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
-#include <unordered_map>
+#include <vector>
+
+#include <ylt/util/tl/expected.hpp>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "client_liveness.h"
+#include "offset_allocator/offset_allocator.h"
+#include "storage_usage.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;
@@ -16,39 +21,51 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
+/**
+ * @brief Type of buffer allocator used in the system
+ */
+enum class ReplicaType {
+    MEMORY = 0,      // Memory replica
+    DISK = 1,        // Disk replica
+    LOCAL_DISK = 2,  // Local disk replica
+    NOF_SSD = 3,     // Nvme-oF SSD replica
+    ALL = 4,         // All synchronous replicas in put finalize path
+    DFS = 100,       // Distributed filesystem page-offset replica
+};
+
+struct LiveAllocation {
+    uint64_t offset_from_base{0};
+    uint64_t requested_size{0};
+};
+
 // Constant for unknown free space in allocators that don't track it precisely
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
-/**
- * @brief Status of a buffer in the system
- */
-enum class BufStatus {
-    INIT = 0,      // Initial state
-    COMPLETE = 1,  // Complete state (buffer has been used)
-    FAILED = 2,  // Failed state (allocation failed, upstream should set handle
-                 // to this state)
-    UNREGISTERED = 3,  // Buffer metadata has been deleted
-};
-
-/**
- * @brief Stream operator for BufStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const BufStatus& status) noexcept {
-    static const std::unordered_map<BufStatus, std::string_view> status_strings{
-        {BufStatus::INIT, "INIT"},
-        {BufStatus::COMPLETE, "COMPLETE"},
-        {BufStatus::FAILED, "FAILED"},
-        {BufStatus::UNREGISTERED, "UNREGISTERED"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
 // Forward declarations
 class BufferAllocatorBase;
+class Replica;
+class SegmentAllocatorRegistration;
+
+class SegmentLifetime {
+   public:
+    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+
+    [[nodiscard]] bool isAvailable() const {
+        return available_->load(std::memory_order_acquire);
+    }
+
+    void setAvailable(bool available) const {
+        available_->store(available, std::memory_order_release);
+    }
+
+    [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
+        return available_ == other.available_;
+    }
+
+   private:
+    std::shared_ptr<std::atomic<bool>> available_;
+};
 
 class AllocatedBuffer {
    public:
@@ -58,15 +75,16 @@ class AllocatedBuffer {
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
-                    std::string segment_name, void* buffer_ptr,
-                    std::size_t size,
+                    void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
         : allocator_(std::move(allocator)),
-          segment_name_(std::move(segment_name)),
           buffer_ptr_(buffer_ptr),
           size_(size),
           offset_handle_(std::move(offset_handle)) {}
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    const Descriptor& descriptor);
 
     ~AllocatedBuffer();
 
@@ -80,15 +98,43 @@ class AllocatedBuffer {
     [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
 
     [[nodiscard]] bool isAllocatorValid() const {
-        return !allocator_.expired();
+        return !allocator_.expired() && segment_lifetime_.isAvailable();
+    }
+
+    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
+        return allocator_.lock();
+    }
+
+    [[nodiscard]] bool isAvailable() const {
+        if (!isAllocatorValid()) {
+            return false;
+        }
+        const auto record = std::atomic_load_explicit(
+            &client_liveness_, std::memory_order_acquire);
+        return !record || record->IsServing();
+    }
+
+    void bindClientLiveness(
+        std::shared_ptr<ClientLivenessRecord> client_liveness) {
+        std::atomic_store_explicit(&client_liveness_,
+                                   std::move(client_liveness),
+                                   std::memory_order_release);
+    }
+
+    void bindSegmentLifetime(SegmentLifetime lifetime) {
+        segment_lifetime_ = std::move(lifetime);
+    }
+
+    [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
+        const {
+        return std::atomic_load_explicit(&client_liveness_,
+                                         std::memory_order_acquire);
     }
 
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
-    [[nodiscard]] std::string getSegmentName() const noexcept {
-        return segment_name_;
-    }
+    [[nodiscard]] std::string getSegmentName() const noexcept;
 
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
@@ -96,24 +142,34 @@ class AllocatedBuffer {
 
     // Represents the serializable state
     struct Descriptor {
-        std::string segment_name_;
         uint64_t size_;
         uintptr_t buffer_address_;
-        BufStatus status_;
-        YLT_REFL(Descriptor, segment_name_, size_, buffer_address_, status_);
+        std::string protocol_;
+        std::string transport_endpoint_;
+        YLT_REFL(Descriptor, size_, buffer_address_, protocol_,
+                 transport_endpoint_);
     };
 
-    void mark_complete() { status = BufStatus::COMPLETE; }
+    void change_to_cxl(std::string client_segment_name);
+    void* get_vaddr_from_cxl();
 
    private:
+    bool copyTransferProtocolFrom(const AllocatedBuffer& source);
+
     std::weak_ptr<BufferAllocatorBase> allocator_;
+    SegmentLifetime segment_lifetime_;
+    std::shared_ptr<ClientLivenessRecord> client_liveness_;
     std::string segment_name_;
-    BufStatus status{BufStatus::INIT};
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
+    std::string protocol{"tcp"};
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
+
+    friend class Serializer<AllocatedBuffer>;
+    friend class Replica;
+    friend class SegmentAllocatorRegistration;
 };
 
 /**
@@ -128,7 +184,9 @@ class BufferAllocatorBase {
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
+    virtual uintptr_t base() const = 0;
     virtual std::string getSegmentName() const = 0;
+    virtual std::string getTransportEndpoint() const = 0;
 
     /**
      * Returns the largest free region available in this allocator.
@@ -140,18 +198,67 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+    /**
+     * Attach this allocator to a domain usage tracker exactly once, before it
+     * is published. Registration is immutable afterward and is released by
+     * RAII when the last shared_ptr to the allocator is dropped.
+     */
+    void AttachUsageTracker(
+        const std::shared_ptr<StorageUsageTracker>& usage_tracker);
+
+   protected:
+    [[nodiscard]] size_t GetUsageBytes() const noexcept {
+        return cur_size_.load(std::memory_order_relaxed);
+    }
+    void RecordAllocation(size_t bytes) noexcept;
+    void RecordDeallocation(size_t bytes) noexcept;
+    void SetUsageBytesForRestore(size_t bytes) noexcept {
+        cur_size_.store(bytes, std::memory_order_relaxed);
+    }
+
+   private:
+    std::atomic_size_t cur_size_{0};
+    std::unique_ptr<StorageUsageRegistration> usage_registration_;
+};
+
+/**
+ * A no-op buffer allocator used only for keeping standby promotion metadata
+ * alive. It does not actually allocate memory - replicas constructed from
+ * this allocator are invalid for actual I/O but preserve endpoint info.
+ */
+class DummyBufferAllocator final : public BufferAllocatorBase {
+   public:
+    explicit DummyBufferAllocator(std::string segment_name,
+                                  std::string transport_endpoint)
+        : segment_name_(std::move(segment_name)),
+          transport_endpoint_(std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        return nullptr;
+    }
+    void deallocate(AllocatedBuffer* handle) override {}
+    size_t capacity() const override { return kAllocatorUnknownFreeSpace; }
+    size_t getLargestFreeRegion() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
+    size_t size() const override { return 0; }
+    uintptr_t base() const override { return 0; }
+    std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+   private:
+    std::string segment_name_;
+    std::string transport_endpoint_;
 };
 
 /**
  * CachelibBufferAllocator manages memory allocation using CacheLib's slab
  * allocation strategy.
  *
- * Important alignment requirements:
- * 1. Base address must be at least 8-byte aligned (CacheLib requirement)
- * 2. Base address should be 4MB aligned since the total size must be a multiple
- * of 4MB
- * 3. Use sufficiently high base addresses (e.g., 0x100000000 for 4GB) to avoid
- * memory conflicts
+ * The base address and size must both be aligned to CacheLib's slab size.
  *
  * Example usage:
  * ```cpp
@@ -159,7 +266,7 @@ class BufferAllocatorBase {
  * const size_t base = 0x100000000;  // 4GB aligned
  * const size_t base = 0x200000000;  // 8GB aligned
  *
- * // Bad - will likely crash
+ * // Bad - Create() returns ErrorCode::INVALID_PARAMS
  * const size_t base = 0x1234;       // Too low, unaligned
  * const size_t base = 0x100000001;  // Not 4MB aligned
  * ```
@@ -168,7 +275,10 @@ class CachelibBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
-    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size);
+    static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
+    Create(std::string segment_name, size_t base, size_t size,
+           std::string transport_endpoint,
+           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
@@ -177,8 +287,12 @@ class CachelibBufferAllocator
     void deallocate(AllocatedBuffer* handle) override;
 
     size_t capacity() const override { return total_size_; }
-    size_t size() const override { return cur_size_.load(); }
+    size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -190,11 +304,18 @@ class CachelibBufferAllocator
     }
 
    private:
+    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
+                            std::string transport_endpoint,
+                            ReplicaType replica_type);
+
+    std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
+        const LiveAllocation& allocation);
     // metadata
     const std::string segment_name_;
     const size_t base_;
     const size_t total_size_;
-    std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
+    const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -203,7 +324,26 @@ class CachelibBufferAllocator
     size_t header_region_size_;
     std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
     facebook::cachelib::PoolId pool_id_;
+
+    friend struct RestoredCachelibBufferAllocator;
+    friend std::optional<struct RestoredCachelibBufferAllocator>
+    ImportCachelibBufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        std::string transport_endpoint,
+        const std::vector<LiveAllocation>& allocations,
+        ReplicaType replica_type);
 };
+
+struct RestoredCachelibBufferAllocator {
+    std::shared_ptr<CachelibBufferAllocator> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<LiveAllocation>& allocations,
+    ReplicaType replica_type = ReplicaType::MEMORY);
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -214,7 +354,9 @@ class OffsetBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
-    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size);
+    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
+                          std::string transport_endpoint,
+                          ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
 
@@ -223,24 +365,61 @@ class OffsetBufferAllocator
     void deallocate(AllocatedBuffer* handle) override;
 
     size_t capacity() const override { return total_size_; }
-    size_t size() const override { return cur_size_.load(); }
+    size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
 
     /**
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
 
+    // Public method to get offset_allocator
+    std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
+        const {
+        return offset_allocator_;
+    }
+
    private:
+    void RestoreUsageBytes(size_t bytes) noexcept {
+        SetUsageBytesForRestore(bytes);
+    }
+
     // metadata
     const std::string segment_name_;
     const size_t base_;
     const size_t total_size_;
-    std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
+    const ReplicaType replica_type_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    friend class Serializer<OffsetBufferAllocator>;
 };
+
+struct RestoredOffsetBufferAllocator {
+    std::shared_ptr<OffsetBufferAllocator> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+// Reconstructs an empty OffsetBufferAllocator from final live allocations.
+// The returned buffers follow allocation input order. No state is exposed on
+// validation or allocation failure.
+std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<LiveAllocation>& allocations,
+    ReplicaType replica_type = ReplicaType::MEMORY);
+
+tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
+CreateBufferAllocator(BufferAllocatorType allocator_type,
+                      std::string segment_name, size_t base, size_t size,
+                      std::string transport_endpoint,
+                      ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address
